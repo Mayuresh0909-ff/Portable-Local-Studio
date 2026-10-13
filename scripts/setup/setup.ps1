@@ -250,17 +250,43 @@ $steps = 8
 # ── Step 1: Portable Node.js ──────────────────────────────────────────────────
 Print-Step 1 $steps "Setting up portable Node.js (app/tools/node-win/)"
 
+$expectedNodeVersion = "v22.23.2"
+
+function Test-PortableNodeRuntime {
+    param([string]$ExpectedVersion)
+
+    try {
+        $nodeVersion = (& $nodeExe --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne $ExpectedVersion) {
+            return $false
+        }
+
+        # npm --version can succeed even when npm's bundled dependency tree is broken.
+        # cache verify loads npm's cache modules without installing project packages.
+        $smokeCache = Join-Path $env:TEMP ("pls-npm-smoke-" + [Guid]::NewGuid().ToString("N"))
+        $npmExitCode = 1
+        try {
+            & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") cache verify --cache $smokeCache --loglevel=error *> $null
+            $npmExitCode = $LASTEXITCODE
+        } finally {
+            Remove-Item $smokeCache -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        return ($npmExitCode -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 $nodeReady = $false
 if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
-    try {
-        $v = & $nodeExe --version
-        # Test if npm is functional (doesn't throw parsing/unexpected token errors)
-        $npmTest = & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") --version 2>&1
-        if ($LASTEXITCODE -eq 0 -and $npmTest -match "^\d+\.\d+\.\d+") {
-            $nodeReady = $true
-            Print-OK "Portable Node.js already ready: $v"
-        }
-    } catch {}
+    $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
+    if (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion) {
+        $nodeReady = $true
+        Print-OK "Portable Node.js and npm already ready: $v"
+    } else {
+        Print-Warn "Portable Node.js/npm is outdated or failed the npm runtime check. Reinstalling..."
+    }
 }
 
 if (-not $nodeReady) {
@@ -273,9 +299,9 @@ if (-not $nodeReady) {
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
     $ok = Invoke-RichDownload `
-        -Url  "https://nodejs.org/dist/v22.12.0/node-v22.12.0-win-x64.zip" `
+        -Url  "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip" `
         -Dest $nodeZip `
-        -Label "Node.js v22.12.0 LTS (Portable ZIP)"
+        -Label "Node.js v22.23.2 LTS (Portable ZIP)"
 
     if (-not $ok) { Print-Fail "Cannot download Node.js."; Read-Host; exit 1 }
 
@@ -295,13 +321,8 @@ if (-not $nodeReady) {
     # Re-verify
     $nodeReady = $false
     if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
-        try {
-            $v = & $nodeExe --version
-            $npmTest = & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") --version 2>&1
-            if ($LASTEXITCODE -eq 0 -and $npmTest -match "^\d+\.\d+\.\d+") {
-                $nodeReady = $true
-            }
-        } catch {}
+        $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
+        $nodeReady = Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion
     }
 
     if (-not $nodeReady) {
