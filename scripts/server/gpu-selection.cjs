@@ -347,6 +347,169 @@ function describeGpuFallback({ cuda, vulkan }) {
   return `No compatible GPU image backend is available (${reasons.join("; ")}). Using CPU.`;
 }
 
+// ── Backend probe output classification ───────────────────────────────────────
+// Pure functions: they take the captured output and exit status of a backend launched with a
+// deliberately missing model, and decide whether the device initialized. serve.cjs does the
+// spawning and passes the results here.
+
+// Explicit device, runtime, or kernel failures. Any match rejects the device, even when the output
+// also contains "loading model". Each pattern is specific to a device or runtime error. Generic
+// words such as "failed" alone are not patterns, to avoid rejecting a backend over benign warnings.
+const DEVICE_FAILURE_PATTERNS = [
+  // Vulkan
+  /vkCreateDevice failed/i,
+  /VK_ERROR_(INITIALIZATION_FAILED|DEVICE_LOST|INCOMPATIBLE_DRIVER|OUT_OF_DEVICE_MEMORY|FEATURE_NOT_PRESENT)/,
+  /ggml_vulkan:[^\n]*\b(failed|error)\b/i,
+  /(failed to|unable to) (create|init|initialize)\b[^\n]*\b(device|backend|gpu|vulkan|cuda)\b/i,
+  /\b(device|backend|gpu|vulkan|cuda)\b[^\n]*\b(failed to|unable to) (create|init|initialize)\b/i,
+  /no (usable |compatible )?(vulkan|cuda|gpu) devices?\b/i,
+  /(vulkan|cuda|gpu) (device|backend) (is )?(unavailable|not available|lost)\b/i,
+  // CUDA
+  /CUDA error/i,
+  /\bcudaError\w+/,
+  /no kernel image is available/i,
+  /no CUDA-capable device/i,
+  /CUDA driver version is insufficient/i,
+  /ggml_cuda_init:[^\n]*\b(failed|error)\b/i,
+  /failed to initialize CUDA/i,
+  // Runtime, DLL, and kernel compatibility
+  /\b[\w.-]+\.dll\b[^\n]*\b(not found|missing|cannot find|could not be loaded|is not a valid)/i,
+  /could not load [\w.-]+\.dll/i,
+  /incompatible (driver|runtime|kernel|binary)/i,
+];
+
+// Output from the deliberate missing-model probe. Reaching this message means the backend started
+// and got past argument parsing. It does not, by itself, prove the device initialized.
+const MISSING_MODEL_PATTERNS = [
+  /__backend_probe_missing__/,
+  /(no such file or directory|cannot open|failed to open|could not open|does not exist|not found)[^\n]{0,200}\.(safetensors|gguf|ckpt|bin)\b/i,
+  /\.(safetensors|gguf|ckpt)\b[^\n]{0,120}(no such file|does not exist|not found|cannot open|failed to open)/i,
+  /model (file )?(not found|does not exist|is missing)/i,
+];
+
+function firstMatchingLine(output, patterns) {
+  const lines = stripAnsi(String(output || "")).split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed && patterns.some((pattern) => pattern.test(trimmed))) return trimmed.slice(0, 240);
+  }
+  return null;
+}
+
+function findDeviceFailureLine(output) {
+  return firstMatchingLine(output, DEVICE_FAILURE_PATTERNS);
+}
+
+function isMissingModelOutput(output) {
+  return MISSING_MODEL_PATTERNS.some((pattern) => pattern.test(stripAnsi(String(output || ""))));
+}
+
+// True when the binary rejected --backend, so the probe must be retried without device flags.
+function shouldRetryWithoutDeviceFlags(output) {
+  const text = String(output || "");
+  return text.includes("unknown argument") && text.includes("--backend");
+}
+
+// The device a backend uses when no device flag is passed is identified only if its own output
+// lists exactly one device of that kind. With several devices listed, the backend's choice is not
+// identified, so the result is null.
+function confirmUnpinnedDevice(output, kind) {
+  const devices = kind === "cuda" ? parseCudaDeviceLog(output) : parseVulkanDeviceLog(output);
+  if (devices.length !== 1 || !devices[0].name) return null;
+  return devices[0];
+}
+
+// Decides whether one probe run shows a usable device.
+// Input: { output, exitCode, errorCode, platform, cliName, stage, supportsFlags }
+//   errorCode: spawn error code such as "ETIMEDOUT" or "ENOENT", or null.
+//   stage: "primary" (with device flags) or "fallback" (retry without device flags).
+// Returns: { accepted, notFound?, reason?, probeError?, initConfirmed?, note?, validationError?,
+//            output, supportsFlags, deviceFailure? }
+//   probeError marks a probe that never produced a verdict (timeout, spawn error, no output).
+//   Those are not ordinary rejections, so callers can report them as such.
+function classifyBackendProbe({
+  output = "",
+  exitCode = null,
+  errorCode = null,
+  platform = "linux",
+  cliName = null,
+  stage = "primary",
+  supportsFlags = true,
+} = {}) {
+  const text = stripAnsi(String(output || ""));
+  const lower = text.toLowerCase();
+  const subject = stage === "fallback" ? "The fallback probe without device flags" : "The probe";
+  const base = { supportsFlags, output: text };
+  const exitText = exitCode === null || exitCode === undefined ? "ended without an exit code" : `exited with code ${exitCode}`;
+
+  if (errorCode === "ETIMEDOUT") {
+    return { ...base, accepted: false, probeError: "timeout", reason: `${subject} timed out after 5 seconds.` };
+  }
+  if (errorCode) {
+    return { ...base, accepted: false, probeError: "start", reason: `${subject} could not be started (${errorCode}).` };
+  }
+
+  const unsignedExitCode = exitCode === null || exitCode === undefined ? null : Number(exitCode) >>> 0;
+  if (platform === "win32" && unsignedExitCode === 0xC0000135) {
+    return {
+      ...base,
+      accepted: false,
+      validationError: true,
+      reason: "Windows could not start this backend because a required DLL is missing (0xC0000135). Run scripts/setup/setup.ps1 to install the Microsoft Visual C++ runtime and repair the backend.",
+    };
+  }
+  if (platform === "win32" && unsignedExitCode === 0xC000001D) {
+    return {
+      ...base,
+      accepted: false,
+      validationError: true,
+      reason: "This Windows backend used a CPU instruction that this processor does not support (0xC000001D). Run scripts/setup/setup.ps1 to replace it with the runtime-dispatched backend build.",
+    };
+  }
+
+  if (/backend '[^']*' was not found/i.test(text)) {
+    return { ...base, accepted: false, notFound: true, reason: `Device ${cliName || "requested"} is not present.` };
+  }
+  if (lower.includes("backend config failed")) {
+    return { ...base, accepted: false, reason: findFirstErrorLine(text) || `Backend ${cliName || ""} could not be configured.` };
+  }
+  // Dynamic linker and glibc failures: the binary cannot run on this system at all.
+  if (lower.includes("glibc") || lower.includes("libc.so") || lower.includes("libstdc++") || lower.includes("cannot open shared object")) {
+    return { ...base, accepted: false, reason: findFirstErrorLine(text) || "A required shared library is missing or incompatible." };
+  }
+
+  // An explicit device failure wins over every success marker below.
+  const deviceFailure = findDeviceFailureLine(text);
+  if (deviceFailure) {
+    return { ...base, accepted: false, deviceFailure: true, reason: deviceFailure };
+  }
+
+  const reachedModelLoad = /loading model/i.test(text);
+  const banner = /stable-diffusion\.cpp/i.test(text);
+  const missingModel = isMissingModelOutput(text);
+  const notConfirmedNote = "The output shows the backend started, but not that the device initialized.";
+
+  if (reachedModelLoad) {
+    // The missing-model exit is expected. A nonzero exit is not a rejection by itself.
+    return { ...base, accepted: true, initConfirmed: true, note: null };
+  }
+  if (missingModel) {
+    return { ...base, accepted: true, initConfirmed: false, note: notConfirmedNote };
+  }
+  if (banner && exitCode === 0) {
+    return { ...base, accepted: true, initConfirmed: false, note: notConfirmedNote };
+  }
+
+  if (stage === "fallback" && !text.trim()) {
+    return { ...base, accepted: false, probeError: "no-output", reason: `The fallback probe without device flags produced no output (it ${exitText}).` };
+  }
+  return {
+    ...base,
+    accepted: false,
+    reason: findFirstErrorLine(text) || `The backend ${exitText} before loading a model.`,
+  };
+}
+
 // ── Selection ─────────────────────────────────────────────────────────────────
 
 // A probe that throws is a failed probe, not a crash of the whole selection.
@@ -441,22 +604,45 @@ function selectCudaBackend({ installed, nvidiaSmi = null, inventory = null, pref
       accepted: Boolean(probeResult.accepted),
       notFound: Boolean(probeResult.notFound),
       reason: probeResult.reason || null,
+      error: probeResult.probeError || null,
+      initConfirmed: typeof probeResult.initConfirmed === "boolean" ? probeResult.initConfirmed : null,
     });
     if (!probeResult.accepted) continue;
 
-    const name = findDeviceNameInLog(probeResult.output, "cuda", candidate.index) || candidate.name || `NVIDIA GPU (CUDA ${candidate.index})`;
+    const pinned = probeResult.supportsFlags !== false;
+    // An unpinned binary's device is identified only by its own output (see confirmUnpinnedDevice).
+    // The preferred candidate is never reported as the active device.
+    const confirmed = pinned ? null : confirmUnpinnedDevice(probeResult.output, "cuda");
     result.available = true;
     result.reason = null;
-    result.device = {
-      index: probeResult.supportsFlags === false ? null : candidate.index,
-      name,
-      vramGb: candidate.vramGb ?? null,
-      displayActive: candidate.displayActive ?? null,
-      pinned: probeResult.supportsFlags !== false,
-      source: candidate.source,
-    };
-    if (!result.device.pinned) {
+    result.device = pinned
+      ? {
+        index: candidate.index,
+        name: findDeviceNameInLog(probeResult.output, "cuda", candidate.index) || candidate.name || `NVIDIA GPU (CUDA ${candidate.index})`,
+        candidateName: null,
+        identityConfirmed: true,
+        vramGb: candidate.vramGb ?? null,
+        displayActive: candidate.displayActive ?? null,
+        pinned: true,
+        initConfirmed: probeResult.initConfirmed !== false,
+        source: candidate.source,
+      }
+      : {
+        index: null,
+        name: confirmed ? confirmed.name : null,
+        candidateName: candidate.name || null,
+        identityConfirmed: Boolean(confirmed),
+        vramGb: confirmed && typeof confirmed.vramGb === "number" ? confirmed.vramGb : null,
+        displayActive: null,
+        pinned: false,
+        initConfirmed: probeResult.initConfirmed !== false,
+        source: "backend-automatic",
+      };
+    if (!pinned) {
       result.notes.push("This CUDA binary does not accept --backend, so the backend chooses the device.");
+      result.notes.push(confirmed
+        ? `The backend lists one CUDA device: ${confirmed.name}.`
+        : `The active CUDA device is not confirmed${candidate.name ? `; ${candidate.name} was the preferred candidate, not a confirmed device` : ""}.`);
     }
     return result;
   }
@@ -510,14 +696,14 @@ function selectVulkanBackend({
   const listedByIndex = new Map(listed.map((device) => [device.index, device]));
 
   let indices;
-  if (listed.length) {
+  if (first.supportsFlags === false) {
+    // The binary cannot be told which device to use. Probing other indices would only repeat
+    // this run, so there is one result, and the backend's device is not identified by index.
+    indices = [0];
+  } else if (listed.length) {
     indices = listed.map((device) => device.index).slice(0, MAX_PROBED_VULKAN_DEVICES);
   } else if (first.notFound) {
     indices = [];
-  } else if (first.supportsFlags === false) {
-    // The binary cannot be told which device to use, so probing more indices would only
-    // repeat the same result.
-    indices = [0];
   } else {
     indices = [0];
     for (let index = 1; index < MAX_PROBED_VULKAN_DEVICES; index += 1) {
@@ -549,6 +735,8 @@ function selectVulkanBackend({
       accepted: Boolean(probeResult.accepted),
       notFound: Boolean(probeResult.notFound),
       reason: probeResult.reason || null,
+      error: probeResult.probeError || null,
+      initConfirmed: typeof probeResult.initConfirmed === "boolean" ? probeResult.initConfirmed : null,
       pinned: probeResult.supportsFlags !== false,
     };
   });
@@ -559,6 +747,8 @@ function selectVulkanBackend({
     accepted: device.accepted,
     notFound: device.notFound,
     reason: device.reason,
+    error: device.error,
+    initConfirmed: device.initConfirmed,
   }));
 
   const eligible = devices.filter((device) => device.accepted && !device.virtual);
@@ -585,7 +775,7 @@ function selectVulkanBackend({
 
   if (!chosen) {
     chosen = rankGpuDevices(eligible)[0] || null;
-    if (chosen && !explicit) {
+    if (chosen && !explicit && chosen.pinned) {
       const hasIntegratedAlternative = eligible.some((device) => device !== chosen && device.integrated === true);
       if (chosen.integrated === true) {
         result.notes.push(`Only an integrated Vulkan GPU (${chosen.name || `device ${chosen.index}`}) is usable; using it.`);
@@ -605,22 +795,51 @@ function selectVulkanBackend({
 
   result.available = true;
   result.reason = null;
-  result.device = {
-    index: chosen.pinned ? chosen.index : null,
-    name: chosen.name || `Vulkan device ${chosen.index}`,
-    vendor: chosen.vendor,
-    integrated: chosen.integrated,
-    vramGb: chosen.vramGb,
-    pinned: chosen.pinned,
-    source: explicit ? "user-preference" : "auto",
-  };
-  if (!chosen.pinned) {
+  if (chosen.pinned) {
+    result.device = {
+      index: chosen.index,
+      name: chosen.name || `Vulkan device ${chosen.index}`,
+      candidateName: null,
+      identityConfirmed: true,
+      vendor: chosen.vendor,
+      integrated: chosen.integrated,
+      vramGb: chosen.vramGb,
+      pinned: true,
+      initConfirmed: chosen.initConfirmed !== false,
+      source: explicit ? "user-preference" : "auto",
+    };
+  } else {
+    // Unpinned: the candidate is not the active device unless the backend's own output lists
+    // exactly one device.
+    const confirmed = confirmUnpinnedDevice(probeResults.get(chosen.index).output, "vulkan");
+    result.device = {
+      index: null,
+      name: confirmed ? confirmed.name : null,
+      candidateName: chosen.name || null,
+      identityConfirmed: Boolean(confirmed),
+      vendor: confirmed ? classifyGpuName(confirmed.name).vendor : null,
+      integrated: confirmed && typeof confirmed.integrated === "boolean" ? confirmed.integrated : null,
+      vramGb: confirmed && typeof confirmed.vramGb === "number" ? confirmed.vramGb : null,
+      pinned: false,
+      initConfirmed: chosen.initConfirmed !== false,
+      source: "backend-automatic",
+    };
     result.notes.push("This Vulkan binary does not accept --backend, so the backend chooses the device.");
+    result.notes.push(confirmed
+      ? `The backend lists one Vulkan device: ${confirmed.name}.`
+      : `The active Vulkan device is not confirmed${chosen.name ? `; ${chosen.name} was the preferred candidate, not a confirmed device` : ""}.`);
   }
   return result;
 }
 
 module.exports = {
+  DEVICE_FAILURE_PATTERNS,
+  MISSING_MODEL_PATTERNS,
+  findDeviceFailureLine,
+  isMissingModelOutput,
+  shouldRetryWithoutDeviceFlags,
+  confirmUnpinnedDevice,
+  classifyBackendProbe,
   INTEGRATED_GPU_NAME_PATTERNS,
   classifyGpuName,
   isVirtualOrSoftwareGpu,

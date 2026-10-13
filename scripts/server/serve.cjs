@@ -26,6 +26,9 @@ const {
   describeGpuFallback,
   selectCudaBackend,
   selectVulkanBackend,
+  classifyBackendProbe,
+  shouldRetryWithoutDeviceFlags,
+  confirmUnpinnedDevice,
 } = require("./gpu-selection.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
@@ -3272,6 +3275,20 @@ function formatBackendDeviceLabel(name, cliName) {
   return cliName ? `${name} [${cliName}]` : name;
 }
 
+// Label shown in the UI and progress endpoint. A pinned device is named as selected. An unpinned
+// device is named only when the backend's own output identifies it (loggedName). Otherwise the
+// label says the device is not confirmed, and it does not name the preferred candidate.
+// The text avoids "vulkan" and "cuda" for unconfirmed devices, which the frontend reads as a
+// confirmed GPU backend.
+function describeBackendDeviceLabel(summary, kind, loggedName = null) {
+  if (summary.pinned && summary.cliName) {
+    return formatBackendDeviceLabel(loggedName || summary.name || summary.cliName, summary.cliName);
+  }
+  const confirmedName = loggedName || (summary.identityConfirmed ? summary.name : null);
+  if (confirmedName) return `${confirmedName} [${kind}, device chosen by backend]`;
+  return "Automatic device selection (device not confirmed)";
+}
+
 function summarizeBackendSelection(selection) {
   const device = selection.device;
   return {
@@ -3281,10 +3298,13 @@ function summarizeBackendSelection(selection) {
     device: device ? {
       index: device.index,
       name: device.name,
+      candidateName: device.candidateName ?? null,
+      identityConfirmed: device.identityConfirmed === true,
       vramGb: device.vramGb ?? null,
       integrated: device.integrated ?? null,
       displayActive: device.displayActive ?? null,
       pinned: device.pinned !== false,
+      initConfirmed: device.initConfirmed ?? null,
       source: device.source,
     } : null,
     probes: selection.probes || [],
@@ -3296,8 +3316,15 @@ function summarizeBackendSelection(selection) {
 function describeSelectionForLog(label, kind, selection) {
   if (!selection.installed) return `${label}: not installed`;
   if (selection.available && selection.device) {
-    const cli = Number.isInteger(selection.device.index) ? ` [${kind}${selection.device.index}]` : " [backend default]";
-    return `${label}: using ${selection.device.name}${cli}`;
+    const device = selection.device;
+    if (device.pinned && Number.isInteger(device.index)) {
+      return `${label}: using ${device.name} [${kind}${device.index}]`;
+    }
+    if (device.identityConfirmed && device.name) {
+      return `${label}: using ${device.name} (the backend's only listed device; chosen by the backend)`;
+    }
+    const candidate = device.candidateName ? `; ${device.candidateName} was the preferred candidate and is not confirmed as active` : "";
+    return `${label}: available, but the backend chooses the device and it is not confirmed${candidate}`;
   }
   return `${label}: unavailable - ${selection.reason || "no usable device"}`;
 }
@@ -3307,10 +3334,13 @@ function getSelectedBackendDeviceSummary(kind) {
   const options = cachedBackendOptions;
   const device = options && options.selection && options.selection[kind] && options.selection[kind].device;
   if (!device) return null;
+  const pinned = device.pinned !== false && Number.isInteger(device.index);
   return {
     index: device.index,
     name: device.name,
-    cliName: Number.isInteger(device.index) ? `${kind}${device.index}` : null,
+    pinned,
+    identityConfirmed: device.identityConfirmed === true,
+    cliName: pinned ? `${kind}${device.index}` : null,
   };
 }
 
@@ -3489,9 +3519,21 @@ function getBackendOptions({ refresh = false } = {}) {
   return cachedBackendOptions;
 }
 
+function runBackendProbe(binaryPath, args, options) {
+  const result = spawnSync(binaryPath, args, options);
+  return {
+    output: `${result.stdout || ""}\n${result.stderr || ""}`,
+    exitCode: result.status,
+    errorCode: result.error ? (result.error.code || "ERROR") : null,
+  };
+}
+
 // Initializes a backend on one device. The model path is intentionally missing, so the backend
 // exits after creating its device context. "loading model" is printed only after that point.
 // notFound means the device index does not exist on this machine.
+// Launches the backend with a deliberately missing model and decides from its output whether the
+// device initialized. The verdict comes from classifyBackendProbe (gpu-selection.cjs). This
+// function only spawns and passes the results along.
 function probeBackendDevice(binaryPath, backendName, cliBackendName = null) {
   if (!binaryPath || !fs.existsSync(binaryPath)) {
     return { accepted: false, reason: "The backend executable is missing." };
@@ -3528,63 +3570,33 @@ function probeBackendDevice(binaryPath, backendName, cliBackendName = null) {
       const existing = spawnEnv.DYLD_LIBRARY_PATH || "";
       spawnEnv.DYLD_LIBRARY_PATH = dir + (existing ? ":" + existing : "");
     }
-    let result = spawnSync(binaryPath, probeArgs, { env: spawnEnv, encoding: "utf8", timeout: 5000 });
-    if (result.error) {
-      return {
-        accepted: false,
-        reason: result.error.code === "ETIMEDOUT"
-          ? "The probe timed out after 5 seconds."
-          : `The backend could not be started (${result.error.code || result.error.message}).`,
-      };
-    }
-    let output = `${result.stdout || ""}\n${result.stderr || ""}`;
-    const unsignedExitCode = Number(result.status) >>> 0;
-    if (osPlatform === "win32" && unsignedExitCode === 0xC0000135) {
-      backendValidationErrors[binaryPath] = "Windows could not start this backend because a required DLL is missing (0xC0000135). Run scripts/setup/setup.ps1 to install the Microsoft Visual C++ runtime and repair the backend.";
-      return { accepted: false, reason: backendValidationErrors[binaryPath] };
-    }
-    if (osPlatform === "win32" && unsignedExitCode === 0xC000001D) {
-      backendValidationErrors[binaryPath] = "This Windows backend used a CPU instruction that this processor does not support (0xC000001D). Run scripts/setup/setup.ps1 to replace it with the runtime-dispatched backend build.";
-      return { accepted: false, reason: backendValidationErrors[binaryPath] };
-    }
+    const spawnOptions = { env: spawnEnv, encoding: "utf8", timeout: 5000 };
 
+    const first = runBackendProbe(binaryPath, probeArgs, spawnOptions);
     let supportsFlags = true;
-    // Some binaries do not support --backend. If we see "unknown argument", retry without
-    // device flags so we can still verify the binary launches. Its device is then not pinned.
-    if (output.includes("unknown argument") && output.includes("--backend")) {
+    let verdict;
+    if (!first.errorCode && shouldRetryWithoutDeviceFlags(first.output)) {
+      // The binary does not accept --backend. Its device is then chosen by the backend, not pinned.
       supportsFlags = false;
       const fallbackArgs = [
         "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
         "--listen-port", "18082",
       ];
-      result = spawnSync(binaryPath, fallbackArgs, { env: spawnEnv, encoding: "utf8", timeout: 5000 });
-      output = `${result.stdout || ""}\n${result.stderr || ""}`;
+      const fallback = runBackendProbe(binaryPath, fallbackArgs, spawnOptions);
+      verdict = classifyBackendProbe({
+        ...fallback, platform: osPlatform, cliName, stage: "fallback", supportsFlags,
+      });
+    } else {
+      verdict = classifyBackendProbe({
+        ...first, platform: osPlatform, cliName, stage: "primary", supportsFlags,
+      });
     }
 
-    const lower = output.toLowerCase();
-    if (/backend '[^']*' was not found/i.test(output)) {
-      return { accepted: false, notFound: true, supportsFlags, output, reason: `Device ${cliName} is not present.` };
-    }
-    if (lower.includes("backend config failed")) {
-      return { accepted: false, supportsFlags, output, reason: findFirstErrorLine(output) || `Backend ${cliName} could not be configured.` };
-    }
-    // Reject binaries that fail at the dynamic linker / glibc level.
-    if (lower.includes("glibc") || lower.includes("libc.so") || lower.includes("libstdc++") || lower.includes("cannot open shared object")) {
-      return { accepted: false, supportsFlags, output, reason: findFirstErrorLine(output) || "A required shared library is missing or incompatible." };
-    }
-    // A healthy binary prints project-specific log lines when it tries to load the model.
-    const deviceFailure = /failed to (create|init|initialize)|unable to (create|init)|no (usable )?(vulkan|cuda) devices/i.test(output);
-    const isOk = lower.includes("loading model") || (lower.includes("stable-diffusion.cpp") && !deviceFailure);
-    if (isOk) {
-      backendSupportsFlags[binaryPath] = supportsFlags;
-      return { accepted: true, supportsFlags, output };
-    }
-    return {
-      accepted: false,
-      supportsFlags,
-      output,
-      reason: findFirstErrorLine(output) || `The backend exited with code ${result.status} before loading a model.`,
-    };
+    if (verdict.validationError) backendValidationErrors[binaryPath] = verdict.reason;
+    if (verdict.accepted) backendSupportsFlags[binaryPath] = supportsFlags;
+    const result = { ...verdict };
+    delete result.validationError;
+    return result;
   } catch (error) {
     return { accepted: false, reason: `The probe failed: ${error.message}` };
   }
@@ -4842,7 +4854,7 @@ async function startBackend(settings = {}) {
     ? getSelectedBackendDeviceSummary(requestedBackend)
     : null;
   if (selectedBackendDevice) {
-    const label = formatBackendDeviceLabel(selectedBackendDevice.name, selectedBackendDevice.cliName);
+    const label = describeBackendDeviceLabel(selectedBackendDevice, requestedBackend);
     currentSettings.backendDevice = label;
     backendLoadState.device = label;
   }
@@ -4988,11 +5000,16 @@ async function startBackend(settings = {}) {
       backendError = runtimeLinkerError;
       backendLoadState.phase = "Linux runtime is too old for this backend";
     }
-    // Accept a device line only if it names the device this process was started with.
-    if (selectedBackendDevice && Number.isInteger(selectedBackendDevice.index)) {
-      const loggedName = findDeviceNameInLog(cleanOutput, requestedBackend, selectedBackendDevice.index);
+    // Accept a device name only if the output identifies the device this process uses:
+    // the pinned index, or the single device an unpinned backend lists.
+    if (selectedBackendDevice) {
+      const loggedName = selectedBackendDevice.pinned
+        ? (Number.isInteger(selectedBackendDevice.index)
+          ? findDeviceNameInLog(cleanOutput, requestedBackend, selectedBackendDevice.index)
+          : null)
+        : (confirmUnpinnedDevice(cleanOutput, requestedBackend)?.name || null);
       if (loggedName) {
-        const label = formatBackendDeviceLabel(loggedName, selectedBackendDevice.cliName);
+        const label = describeBackendDeviceLabel(selectedBackendDevice, requestedBackend, loggedName);
         backendLoadState.device = label;
         currentSettings.backendDevice = label;
       }

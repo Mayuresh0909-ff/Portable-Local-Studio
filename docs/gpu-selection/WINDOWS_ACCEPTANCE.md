@@ -54,9 +54,11 @@ Check these fields:
 |---|---|
 | `selection.cuda.installed` | `true` if the CUDA backend is installed, otherwise `false` |
 | `selection.cuda.available` | `true` if the CUDA backend initializes the RTX 5060 |
-| `selection.cuda.device.name` | `NVIDIA GeForce RTX 5060 Laptop GPU` |
+| `selection.cuda.device.name` | `NVIDIA GeForce RTX 5060 Laptop GPU` when `pinned` is `true`. When `pinned` is `false`, it is `null` unless the backend's output lists exactly one device |
 | `selection.cuda.device.displayActive` | `false` (the NVIDIA GPU is not driving the display) |
-| `selection.cuda.device.pinned` | `true` |
+| `selection.cuda.device.pinned` | `true`. If `false`, the backend chose the device itself, so the RTX 5060 is not confirmed as active |
+| `selection.cuda.device.identityConfirmed` | `true` when the device is confirmed (pinned, or the only listed device). A `false` value means the device was not confirmed, and the run cannot prove the RTX 5060 was used |
+| `selection.cuda.probes[].error` | Empty for a normal result. `timeout` or `start` means the probe never produced a verdict |
 | `selection.vulkan.device.integrated` | `false` if Vulkan selects the RTX 5060; `true` only if no discrete device works |
 | `selection.*.notes` | Explains any preference, rejection, or fallback |
 | `selection.*.probes` | One entry per probed device, each with `accepted` and `reason` |
@@ -87,8 +89,10 @@ the same as before without `?refresh=1`. This shows that the cache did not chang
 2. In the image generator, select the GPU backend (CUDA if it is the selected backend, or Vulkan
    for the Vulkan run). Use the default settings with a short prompt, such as
    `a red ceramic teapot on a table`. Use a model that is already installed.
-3. Start generation. Watch the loading text. It should read `Loading on <backend> • <name> [cuda0]`
-   (or `[vulkan<N>]`).
+3. Start generation. Watch the loading text. For a pinned device it should read
+   `Loading on <backend> • <name> [cuda0]` (or `[vulkan<N>]`). If the device was not pinned, it should
+   read `Loading on <backend> • Automatic device selection (device not confirmed)`. Record which one you
+   see. An unconfirmed label means the run does not prove which GPU rendered the image.
 4. While it runs, open Task Manager → Performance. Check GPU usage by engine:
    - The RTX 5060 should show `Compute_0` or `3D` activity.
    - The Radeon 610M should not show a large rise caused by generation.
@@ -124,7 +128,8 @@ Only run this if it can be done safely. Do not remove the driver or edit system 
 |---|---|---|---|
 | 0. nvidia-smi and display | RTX 5060 listed, display_active Disabled | | |
 | 1. Startup `[gpu]` lines | CUDA and Vulkan both explain their result | | |
-| 2. `selection.cuda.device.name` | RTX 5060 | | |
+| 2. `selection.cuda.device.name` (pinned case) | RTX 5060 | | |
+| 2. `selection.cuda.device.identityConfirmed` | `true` for the RTX 5060, or record that it was unpinned and unconfirmed | | |
 | 2. `displayActive` | false | | |
 | 2. `refresh=1` matches cached | same selection | | |
 | 3. SD_CUDA_DEVICE=0 | pinned, source user-preference | | |

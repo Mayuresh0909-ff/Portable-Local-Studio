@@ -4,7 +4,8 @@ Companion to `DIAGNOSIS.md`. This describes the fix as implemented in:
 
 - `scripts/server/gpu-selection.cjs` (new): pure logic. No process, filesystem, or network access.
 - `scripts/server/serve.cjs` (modified): discovery, probes, launch arguments, log parsing, and routes.
-- `scripts/tests/gpu-selection.test.cjs` (new): regression tests.
+- `scripts/tests/gpu-selection.test.cjs` (new): selection regression tests.
+- `scripts/tests/backend-probe.test.cjs` (new): probe-output classification tests.
 
 ## Four separate layers
 
@@ -56,20 +57,48 @@ is recorded with its reason, and the next candidate is tried.
 - The device name in the UI comes from the log line for the selected index, not the first device line.
 - Launch uses the selected device (`--backend cudaN` / `vulkanN`). It no longer hard-codes `cuda0`.
 
-## Probe acceptance is a heuristic
+## Probe classification
 
-A probe starts the backend with a model path that does not exist. It accepts the device when:
+`serve.cjs` starts the backend with a model path that does not exist. It only spawns the process.
+The verdict comes from `classifyBackendProbe()` in `gpu-selection.cjs`, which is pure and is tested
+on realistic output strings in `backend-probe.test.cjs`. Rules, in order:
 
-- the output contains `loading model`, or
-- the banner is present and no device-failure marker appears
-  (`failed to init`, `no usable vulkan devices`, and similar).
+1. **Spawn-level failures** are probe errors, not rejections: a timeout (`probeError: "timeout"`) or a
+   failed start (`probeError: "start"`).
+2. **Windows exit codes** for a missing DLL (`0xC0000135`) or an unsupported CPU instruction
+   (`0xC000001D`) reject the backend and are recorded as validation errors.
+3. **Config and linker failures** (`backend config failed`, glibc or shared-library errors) reject.
+4. **Explicit device, runtime, or kernel failures** reject, even if the output also says
+   `loading model`. Examples: `vkCreateDevice failed`, `VK_ERROR_INITIALIZATION_FAILED` or
+   `VK_ERROR_DEVICE_LOST`, `No usable Vulkan devices`, `CUDA error: no kernel image is available`,
+   `CUDA driver version is insufficient`, `ggml_cuda_init: failed`, `incompatible driver`, and a
+   missing `*.dll`. The rejection reason is the matching line itself.
+5. **Expected missing-model output** is accepted. This is the deliberate probe's normal ending, and a
+   nonzero exit is not a rejection by itself. `initConfirmed` is true only when the output also shows
+   `loading model`. Otherwise the probe is accepted with a note that the device was not confirmed.
+6. Anything else is rejected, with the first error line or the exit status as the reason.
 
-This shows that the backend initialized the device before the missing model stopped it. It does not
+If a binary rejects `--backend`, the probe is retried without device flags (`stage: "fallback"`).
+A timeout, start failure, or silent exit in the fallback is reported as such (`probeError`), not as
+an ordinary rejection.
+
+The probe shows that the device initialized, as far as the backend's output reports. It does not
 prove that a generation completes on that device. Only a real generation on Windows can show that
 (see `WINDOWS_ACCEPTANCE.md`).
 
-If a binary does not accept `--backend`, the probe retries without device flags. The device is then
-not pinned, and the selection notes say so.
+## Unpinned devices are not identified
+
+If a binary does not accept `--backend`, the backend picks its own device. The result is:
+
+- `pinned: false`, `index: null`.
+- `identityConfirmed: true` only when the backend's own output lists exactly one device. The name
+  is then taken from that listing.
+- Otherwise `identityConfirmed: false` and `name: null`. The preferred candidate is kept in
+  `candidateName` for diagnosis only.
+
+The startup log, the API, and the generation-progress label all follow this. An unconfirmed device is
+labelled `Automatic device selection (device not confirmed)`. That label deliberately avoids the words
+`cuda` and `vulkan`, because the frontend reads those as a confirmed GPU backend.
 
 ## Files and sizes
 
@@ -78,6 +107,7 @@ not pinned, and the selection notes say so.
 | `scripts/server/gpu-selection.cjs` | new, 643 lines | pure logic |
 | `scripts/server/serve.cjs` | modified, +405 / -168 | discovery, probes, launch, routes |
 | `scripts/tests/gpu-selection.test.cjs` | new, 642 lines | 40 tests |
+| `scripts/tests/backend-probe.test.cjs` | new | 37 tests (probe-output classification) |
 | `docs/gpu-selection/DIAGNOSIS.md` | new | root cause |
 | `docs/gpu-selection/DESIGN.md` | new | this file |
 | `docs/gpu-selection/WINDOWS_ACCEPTANCE.md` | new | manual test |
