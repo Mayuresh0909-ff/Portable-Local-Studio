@@ -43,7 +43,7 @@ try {
     # also avoids setup failures when a machine has a newer CUDA toolkit.
     $env:ONNXRUNTIME_NODE_INSTALL_CUDA = "skip"
     $installMode = if (Test-Path (Join-Path $runtimeDir "package-lock.json")) { "ci" } else { "install" }
-    Print-Info "Installing pinned kokoro-js dependencies into app/tts-runtime..."
+    Print-Info "Installing kokoro-js dependencies into app/tts-runtime..."
     & $npmCmd $installMode --prefer-online --no-audit --no-fund --loglevel=error
     if ($LASTEXITCODE -ne 0) {
         Print-Fail "kokoro-js install failed."
