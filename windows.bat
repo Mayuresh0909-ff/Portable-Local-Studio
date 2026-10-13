@@ -45,10 +45,7 @@ if not exist "%SPEECH_BACKEND%" (
     set SETUP_REASON=whisper.cpp speech backend is missing.
     goto :run_setup
 )
-if not exist "%TTS_RUNTIME%" (
-    set SETUP_REASON=Kokoro text-to-speech runtime is missing.
-    goto :run_setup
-)
+:: Kokoro TTS is optional: a missing TTS runtime must not block image/text app startup.
 if exist "%CUDA_BACKEND%" goto :launch
 if exist "%VULKAN_BACKEND%" goto :launch
 set SETUP_REASON=No backend binary is installed.
