@@ -114,7 +114,7 @@ echo   Web UI:     http://localhost:%FRONTEND_PORT%
 echo   GPU API:    Auto-selected by the app (starts at 8080)
 echo   Text API:   Starts when a GGUF model is loaded (port %LLM_PORT%)
 echo   Speech:     Managed locally by the app
-echo   TTS:        Managed locally by the app
+echo   TTS:        Optional (requires Kokoro runtime)
 echo.
 echo   Press Ctrl+C in this window to stop all services.
 echo  ============================================================
