@@ -11,6 +11,22 @@ const os       = require("os");
 const path     = require("path");
 const { spawn, spawnSync, execSync, exec, execFile } = require("child_process");
 const { comprehensiveWebSearch } = require("../search/core");
+const {
+  classifyGpuName,
+  vendorFromPciId,
+  parseVulkaninfoSummary,
+  parseNvidiaSmiCsv,
+  parseWindowsVideoControllers,
+  findFirstErrorLine,
+  pickPrimaryGpu,
+  parseDevicePreference,
+  backendDeviceArgs,
+  findDeviceNameInLog,
+  resolveRequestedBackend,
+  describeGpuFallback,
+  selectCudaBackend,
+  selectVulkanBackend,
+} = require("./gpu-selection.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -581,60 +597,26 @@ function detectLinuxGpuFromSysfs() {
   return null;
 }
 
-function isVirtualOrSoftwareGpu(name) {
-  const lowercase = String(name || "").toLowerCase();
-  return lowercase.includes("virtual desktop") ||
-         lowercase.includes("remote display") ||
-         lowercase.includes("microsoft basic render") ||
-         lowercase.includes("citrix") ||
-         lowercase.includes("software rasterizer") ||
-         lowercase.includes("virtualbox") ||
-         lowercase.includes("vmware");
-}
+// GPU selection state. getBackendOptions() writes these and the launch path reads them, so
+// the device that was probed is the device that is launched.
+let cachedVulkanSelection = null;   // { index, cliName, name } for the Vulkan device chosen by getBackendOptions()
+let cachedCudaSelection = null;     // { index, cliName, name } for the CUDA device chosen by getBackendOptions()
+let cachedBackendOptionsAt = 0;
+let cachedBackendOptionsNegative = false;
+let backendRequestNote = null;      // explains an explicit backend request that could not be honored
 
-let cachedPreferredVulkanBackend = null;
-let cachedPreferredVulkanBackendChecked = false;
+// Vulkan device name passed to --backend. Only a device that the backend initialized in
+// getBackendOptions() is returned. "vulkan0" is a placeholder used before any probe runs.
 function getPreferredVulkanBackendName() {
-  const explicit = String(process.env.SD_VULKAN_DEVICE || process.env.UAIS_VULKAN_DEVICE || "").trim();
-  if (/^vulkan\d+$/i.test(explicit)) return explicit.toLowerCase();
-  if (/^\d+$/.test(explicit)) return `vulkan${explicit}`;
-
-  if (cachedPreferredVulkanBackendChecked) return cachedPreferredVulkanBackend || "vulkan0";
-  cachedPreferredVulkanBackendChecked = true;
-  cachedPreferredVulkanBackend = "vulkan0";
-
-  if (osPlatform !== "linux") return cachedPreferredVulkanBackend;
-  try {
-    const result = spawnSync("vulkaninfo", ["--summary"], {
-      encoding: "utf8",
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
-    });
-    const output = `${result.stdout || ""}\n${result.stderr || ""}`;
-    const devices = [];
-    let current = null;
-    for (const line of output.split(/\r?\n/)) {
-      const gpuMatch = line.match(/^\s*GPU(\d+)\s*:/i);
-      if (gpuMatch) {
-        current = { index: Number(gpuMatch[1]), name: "", type: "" };
-        devices.push(current);
-        continue;
-      }
-      if (!current) continue;
-      const nameMatch = line.match(/deviceName\s*=\s*(.+)$/i);
-      if (nameMatch) current.name = nameMatch[1].trim();
-      const typeMatch = line.match(/deviceType\s*=\s*(.+)$/i);
-      if (typeMatch) current.type = typeMatch[1].trim();
-    }
-    const usable = devices.filter((device) => Number.isInteger(device.index) && !isVirtualOrSoftwareGpu(device.name));
-    const discrete = usable.find((device) => /discrete/i.test(device.type));
-    const amd = usable.find((device) => /amd|radeon/i.test(device.name));
-    const selected = discrete || amd || usable[0];
-    if (selected) cachedPreferredVulkanBackend = `vulkan${selected.index}`;
-  } catch (_) {}
-
-  return cachedPreferredVulkanBackend;
+  if (cachedVulkanSelection && cachedVulkanSelection.cliName) return cachedVulkanSelection.cliName;
+  return "vulkan0";
 }
+
+function getPreferredCudaBackendName() {
+  if (cachedCudaSelection && cachedCudaSelection.cliName) return cachedCudaSelection.cliName;
+  return "cuda0";
+}
+
 
 let cachedLlamaCudaGpu = null;
 let cachedLlamaCudaGpuChecked = false;
@@ -667,11 +649,7 @@ function detectLlamaCudaGpu() {
         free_vram_gb: match[3] ? Math.round((Number(match[3]) / 1024) * 100) / 100 : null,
       });
     }
-    let activeDevices = devices.filter(d => !isVirtualOrSoftwareGpu(d.name));
-    if (activeDevices.length === 0) {
-      activeDevices = devices;
-    }
-    cachedLlamaCudaGpu = activeDevices.sort((a, b) => b.vram_gb - a.vram_gb)[0] || null;
+    cachedLlamaCudaGpu = pickPrimaryLlamaDevice(devices);
   } catch (_) {
     cachedLlamaCudaGpu = null;
   }
@@ -709,11 +687,7 @@ function detectLlamaVulkanGpu() {
         free_vram_gb: match[3] ? Math.round((Number(match[3]) / 1024) * 100) / 100 : null,
       });
     }
-    let activeDevices = devices.filter(d => !isVirtualOrSoftwareGpu(d.name));
-    if (activeDevices.length === 0) {
-      activeDevices = devices;
-    }
-    cachedLlamaVulkanGpu = activeDevices.sort((a, b) => b.vram_gb - a.vram_gb)[0] || null;
+    cachedLlamaVulkanGpu = pickPrimaryLlamaDevice(devices);
   } catch (_) {
     cachedLlamaVulkanGpu = null;
   }
@@ -758,6 +732,129 @@ function detectLlamaSyclGpu() {
   return cachedLlamaSyclGpu;
 }
 
+// ── GPU discovery ─────────────────────────────────────────────────────────────
+// Discovery answers "which GPUs exist, and what does NVIDIA tooling report". It never rejects
+// a GPU because it drives the display. Backend selection (getBackendOptions) decides what is usable.
+let cachedGpuDiscovery = null;
+
+// Windows: every display adapter, including one that is not driving a monitor.
+// Returns null when the query fails, so callers can tell "unknown" from "none".
+function listWindowsVideoControllers() {
+  try {
+    const stdout = execSync(
+      'powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; VRAM = [math]::Round($_.AdapterRAM / 1GB, 2); DisplayAttached = [bool]$_.CurrentHorizontalResolution } } | ConvertTo-Json"',
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 20000, windowsHide: true }
+    ).trim();
+    if (!stdout) return [];
+    const parsed = JSON.parse(stdout);
+    return parseWindowsVideoControllers(Array.isArray(parsed) ? parsed : [parsed]);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Linux: PCI display-class devices (class 0x03xx). Integrated status is unknown here.
+function listLinuxDisplayGpus() {
+  try {
+    const pciDir = "/sys/bus/pci/devices";
+    if (!fs.existsSync(pciDir)) return null;
+    const devices = [];
+    for (const entry of fs.readdirSync(pciDir)) {
+      try {
+        const pciClass = fs.readFileSync(path.join(pciDir, entry, "class"), "utf8").trim().toLowerCase();
+        if (!pciClass.startsWith("0x03")) continue;
+        const vendor = vendorFromPciId(fs.readFileSync(path.join(pciDir, entry, "vendor"), "utf8"));
+        const deviceId = fs.readFileSync(path.join(pciDir, entry, "device"), "utf8").trim();
+        const label = { nvidia: "NVIDIA", amd: "AMD", intel: "Intel" }[vendor] || "GPU";
+        devices.push({
+          index: null,
+          name: `${label} GPU (${deviceId || entry})`,
+          vendor,
+          integrated: null,
+          virtual: false,
+          vramGb: null,
+          displayAttached: null,
+          source: "sysfs",
+        });
+      } catch (_) {}
+    }
+    return devices;
+  } catch (_) {
+    return null;
+  }
+}
+
+// nvidia-smi enumerates GPUs independently of which GPU drives the display, so it is the
+// primary evidence for NVIDIA compute devices. Missing tools and failed queries are reported
+// as errors, not as "no GPU".
+function queryNvidiaSmi() {
+  if (osPlatform === "darwin") {
+    return { ok: false, devices: [], error: "NVIDIA tools are not used on macOS." };
+  }
+  const commands = osPlatform === "win32"
+    ? ["nvidia-smi", "C:\\Windows\\System32\\nvidia-smi.exe", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe"]
+    : ["nvidia-smi", "/usr/bin/nvidia-smi"];
+  const queries = [
+    "index,name,memory.total,memory.free,display_active,pci.bus_id",
+    "index,name,memory.total,memory.free", // older drivers do not know display_active
+  ];
+  let lastError = "nvidia-smi was not found";
+  for (const command of commands) {
+    if (path.isAbsolute(command) && !fs.existsSync(command)) continue;
+    for (const fields of queries) {
+      const result = spawnSync(command, [`--query-gpu=${fields}`, "--format=csv,noheader,nounits"], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      });
+      if (result.error) {
+        lastError = result.error.code === "ENOENT"
+          ? "nvidia-smi was not found"
+          : `nvidia-smi failed (${result.error.code || result.error.message})`;
+        break;
+      }
+      const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+      if (result.status !== 0) {
+        lastError = findFirstErrorLine(output) || `nvidia-smi exited with code ${result.status}`;
+        if (/not a valid field|invalid field/i.test(output)) continue;
+        break;
+      }
+      const devices = parseNvidiaSmiCsv(result.stdout);
+      if (devices.length) return { ok: true, devices, error: null, command };
+      lastError = "nvidia-smi reported no NVIDIA GPUs";
+      break;
+    }
+  }
+  return { ok: false, devices: [], error: lastError };
+}
+
+function getGpuDiscovery(refresh = false) {
+  if (cachedGpuDiscovery && !refresh) return cachedGpuDiscovery;
+  let inventory = null;
+  if (osPlatform === "win32") inventory = listWindowsVideoControllers();
+  else if (osPlatform === "linux") inventory = listLinuxDisplayGpus();
+  cachedGpuDiscovery = {
+    inventory,
+    nvidiaSmi: queryNvidiaSmi(),
+    discoveredAt: Date.now(),
+  };
+  return cachedGpuDiscovery;
+}
+
+// Primary GPU from llama-server --list-devices output. Discrete GPUs win over integrated
+// ones even when an iGPU reports a large shared-memory heap.
+function pickPrimaryLlamaDevice(devices) {
+  const annotated = devices.map((device, position) => ({
+    ...device,
+    ...classifyGpuName(device.name),
+    vramGb: device.vram_gb,
+    position,
+  }));
+  const primary = pickPrimaryGpu(annotated);
+  return primary ? devices[primary.position] : null;
+}
+
 function getGpuInfo() {
   if (cachedGpuInfo) return cachedGpuInfo;
 
@@ -774,54 +871,18 @@ function getGpuInfo() {
       return cachedGpuInfo;
     }
 
-    try {
-      const stdout = execSync(
-        'powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; VRAM = [math]::Round($_.AdapterRAM / 1GB, 2) } } | ConvertTo-Json"',
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-      ).trim();
-      if (stdout) {
-        let gpus = [];
-        try {
-          const parsed = JSON.parse(stdout);
-          if (Array.isArray(parsed)) {
-            gpus = parsed;
-          } else if (parsed && typeof parsed === "object") {
-            gpus = [parsed];
-          }
-        } catch (_) {}
-
-        if (gpus.length > 0) {
-          const discreteKeywords = ["nvidia", "amd", "arc", "geforce", "radeon", "rtx", "gtx"];
-          let activeGpus = gpus.filter(gpu => !isVirtualOrSoftwareGpu(gpu.Name));
-          if (activeGpus.length === 0) {
-            activeGpus = gpus;
-          }
-          let selectedGpu = activeGpus.find(gpu => {
-            const name = String(gpu.Name || "").toLowerCase();
-            return discreteKeywords.some(kw => name.includes(kw));
-          });
-          if (!selectedGpu) {
-            selectedGpu = activeGpus[0];
-          }
-          cachedGpuInfo = {
-            name: selectedGpu.Name || "Unknown GPU",
-            vram_gb: typeof selectedGpu.VRAM === "number" ? selectedGpu.VRAM : 0
-          };
-          return cachedGpuInfo;
-        }
-      }
-    } catch (_) {}
-    // Fallback if Powershell fails or returns empty
-    try {
-      const output = execSync(
-        "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Select-Object -First 1 -ExpandProperty Name\"",
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      ).trim();
-      if (output) {
-        cachedGpuInfo = { name: output, vram_gb: 0 };
+    if (osPlatform === "win32") {
+      // Windows inventory, discrete GPUs first. The display-driving iGPU is not automatically primary.
+      const inventory = getGpuDiscovery().inventory;
+      const primary = inventory ? pickPrimaryGpu(inventory) : null;
+      if (primary) {
+        cachedGpuInfo = {
+          name: primary.name || "Unknown GPU",
+          vram_gb: typeof primary.vramGb === "number" ? primary.vramGb : 0,
+        };
         return cachedGpuInfo;
       }
-    } catch (_) {}
+    }
   }
 
   if (osPlatform === "darwin") {
@@ -3052,22 +3113,6 @@ function cleanupSelected(ids = []) {
   return deleted;
 }
 
-function hasNvidiaGpu() {
-  const info = getGpuInfo().name.toLowerCase();
-  if (info.includes("nvidia")) return true;
-  try {
-    execSync("nvidia-smi", { stdio: "ignore" });
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function hasAmdGpu() {
-  const info = getGpuInfo().name.toLowerCase();
-  return info.includes("amd") || info.includes("advanced micro devices") || info.includes("radeon");
-}
-
 // Detect whether we are running inside WSL2 (Windows Subsystem for Linux).
 // WSL2's GPU paravirtualization (GPU-PV) only exposes a D3D12/DirectX interface
 // to Linux. Vulkan hardware passthrough is only supported for NVIDIA (via CUDA).
@@ -3082,7 +3127,7 @@ function isRunningInWSL() {
   }
 }
 
-function getVulkanUnavailableReason() {
+function getVulkanUnavailableReason(detail = "") {
   if (osPlatform === "win32" && !hasVulkanRuntime()) {
     return "The Vulkan runtime (vulkan-1.dll) is missing. Install or update your GPU vendor driver with Vulkan support, then run setup again so the Vulkan backend folder is repaired.";
   }
@@ -3098,7 +3143,7 @@ function getVulkanUnavailableReason() {
     }
     return "Vulkan GPU is not available in WSL2. WSL2's GPU paravirtualization does not support hardware Vulkan for this GPU. Run natively on Windows or Linux for GPU acceleration.";
   }
-  return "Installed, but this binary did not register a Vulkan backend on this machine.";
+  return detail || "Installed, but this binary did not register a Vulkan backend on this machine.";
 }
 
 let cachedCoreMLPythonPath = null;
@@ -3198,22 +3243,122 @@ function getCoreMLNpuInfo() {
   };
 }
 
-function getBackendOptions() {
-  if (cachedBackendOptions) return cachedBackendOptions;
+const GPU_NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function hasNvidiaEvidence(discovery) {
+  if (discovery.nvidiaSmi && discovery.nvidiaSmi.ok) return true;
+  return Array.isArray(discovery.inventory) && discovery.inventory.some((device) => device.vendor === "nvidia" && !device.virtual);
+}
+
+function hasAmdGpu() {
+  const discovery = getGpuDiscovery();
+  if (Array.isArray(discovery.inventory) && discovery.inventory.some((device) => device.vendor === "amd" && !device.virtual)) {
+    return true;
+  }
+  const info = getGpuInfo().name.toLowerCase();
+  return info.includes("amd") || info.includes("advanced micro devices") || info.includes("radeon");
+}
+
+function readVulkaninfoDevices() {
+  try {
+    const result = spawnSync("vulkaninfo", ["--summary"], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 });
+    return parseVulkaninfoSummary(`${result.stdout || ""}\n${result.stderr || ""}`);
+  } catch (_) {
+    return null;
+  }
+}
+
+function formatBackendDeviceLabel(name, cliName) {
+  return cliName ? `${name} [${cliName}]` : name;
+}
+
+function summarizeBackendSelection(selection) {
+  const device = selection.device;
+  return {
+    installed: selection.installed,
+    available: selection.available,
+    reason: selection.reason,
+    device: device ? {
+      index: device.index,
+      name: device.name,
+      vramGb: device.vramGb ?? null,
+      integrated: device.integrated ?? null,
+      displayActive: device.displayActive ?? null,
+      pinned: device.pinned !== false,
+      source: device.source,
+    } : null,
+    probes: selection.probes || [],
+    devices: selection.devices || selection.candidates || [],
+    notes: selection.notes || [],
+  };
+}
+
+function describeSelectionForLog(label, kind, selection) {
+  if (!selection.installed) return `${label}: not installed`;
+  if (selection.available && selection.device) {
+    const cli = Number.isInteger(selection.device.index) ? ` [${kind}${selection.device.index}]` : " [backend default]";
+    return `${label}: using ${selection.device.name}${cli}`;
+  }
+  return `${label}: unavailable - ${selection.reason || "no usable device"}`;
+}
+
+// Returns the device chosen by getBackendOptions() for the image backend that is being launched.
+function getSelectedBackendDeviceSummary(kind) {
+  const options = cachedBackendOptions;
+  const device = options && options.selection && options.selection[kind] && options.selection[kind].device;
+  if (!device) return null;
+  return {
+    index: device.index,
+    name: device.name,
+    cliName: Number.isInteger(device.index) ? `${kind}${device.index}` : null,
+  };
+}
+
+// Image backend selection. Each layer is decided separately:
+//   1. discovery (getGpuDiscovery) lists GPUs and nvidia-smi status;
+//   2. the CUDA/Vulkan probes decide which devices the installed backend can initialize;
+//   3. gpu-selection.cjs picks the device to use, honoring valid SD_CUDA_DEVICE/SD_VULKAN_DEVICE.
+// Results are cached. The cache is cleared when backends or models change, and a CPU-only result
+// is re-checked after GPU_NEGATIVE_CACHE_TTL_MS or when called with refresh.
+function getBackendOptions({ refresh = false } = {}) {
+  const negativeExpired = cachedBackendOptionsNegative && Date.now() - cachedBackendOptionsAt > GPU_NEGATIVE_CACHE_TTL_MS;
+  if (cachedBackendOptions && !refresh && !negativeExpired) return cachedBackendOptions;
+
+  const discovery = getGpuDiscovery(refresh || negativeExpired);
 
   const cudaInstalled = (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cuda)) ||
                         (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCuda));
-  const cudaAvailable = cudaInstalled && hasNvidiaGpu() && backendAccepts(
-    osPlatform === "win32" ? BACKEND_PATHS.cuda : BACKEND_PATHS.linuxCuda,
-    "cuda"
-  );
+  const cudaPath = osPlatform === "win32" ? BACKEND_PATHS.cuda : BACKEND_PATHS.linuxCuda;
+  const cudaPreference = parseDevicePreference(process.env.SD_CUDA_DEVICE, "cuda");
+  const cudaSelection = selectCudaBackend({
+    installed: cudaInstalled,
+    nvidiaSmi: discovery.nvidiaSmi,
+    inventory: discovery.inventory,
+    preference: cudaPreference,
+    probe: (index) => probeBackendDevice(cudaPath, "cuda", `cuda${index}`),
+  });
+  if (cudaPreference && !cudaPreference.valid) {
+    cudaSelection.notes.push(`Ignoring SD_CUDA_DEVICE="${cudaPreference.raw}" (expected a number such as 0).`);
+  }
+
   const vulkanInstalled = (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.vulkan)) ||
                           (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxVulkan));
-  const vulkanRuntimeAvailable = osPlatform !== "win32" || hasVulkanRuntime();
-  const vulkanAvailable = vulkanInstalled && vulkanRuntimeAvailable && backendAccepts(
-    osPlatform === "win32" ? BACKEND_PATHS.vulkan : BACKEND_PATHS.linuxVulkan,
-    "vulkan"
-  );
+  const vulkanPath = osPlatform === "win32" ? BACKEND_PATHS.vulkan : BACKEND_PATHS.linuxVulkan;
+  const vulkanPreferenceRaw = process.env.SD_VULKAN_DEVICE || process.env.UAIS_VULKAN_DEVICE;
+  const vulkanPreference = parseDevicePreference(vulkanPreferenceRaw, "vulkan");
+  const vulkanSelection = selectVulkanBackend({
+    installed: vulkanInstalled,
+    runtimeReason: osPlatform === "win32" && !hasVulkanRuntime() ? getVulkanUnavailableReason() : null,
+    inventory: discovery.inventory,
+    nvidiaPresent: hasNvidiaEvidence(discovery),
+    preference: vulkanPreference,
+    vulkaninfoDevices: osPlatform === "linux" && vulkanInstalled ? readVulkaninfoDevices() : null,
+    probe: (index) => probeBackendDevice(vulkanPath, "vulkan", `vulkan${index}`),
+  });
+  if (vulkanPreference && !vulkanPreference.valid) {
+    vulkanSelection.notes.push(`Ignoring SD_VULKAN_DEVICE="${vulkanPreference.raw}" (expected a number such as 0).`);
+  }
+
   const rocmInstalled = osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxRocm);
   const rocmAvailable = rocmInstalled && hasAmdGpu() && backendAccepts(BACKEND_PATHS.linuxRocm, "rocm");
   const cpuInstalled = (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCpu)) ||
@@ -3224,6 +3369,8 @@ function getBackendOptions() {
   const openvinoNpu = getOpenVinoNpuInfo();
   const openvinoModels = getOpenVinoModelInfo();
   const openvinoNpuAvailable = openvinoNpu.supported && openvinoModels.some((model) => model.installed);
+  const cudaAvailable = cudaSelection.available;
+  const vulkanAvailable = vulkanSelection.available;
 
   const options = [];
   if (cpuInstalled) options.push({ id: "cpu", label: "CPU", available: true });
@@ -3236,11 +3383,10 @@ function getBackendOptions() {
 
   const unavailable = [];
   if (vulkanInstalled && !vulkanAvailable) {
-    unavailable.push({ id: "vulkan", label: "Vulkan GPU", reason: getVulkanUnavailableReason() });
+    unavailable.push({ id: "vulkan", label: "Vulkan GPU", reason: getVulkanUnavailableReason(vulkanSelection.reason || "") });
   }
   if (cudaInstalled && !cudaAvailable) {
-    const cudaPath = osPlatform === "win32" ? BACKEND_PATHS.cuda : BACKEND_PATHS.linuxCuda;
-    unavailable.push({ id: "cuda", label: "CUDA GPU", reason: backendValidationErrors[cudaPath] || "Installed, but CUDA backend validation failed." });
+    unavailable.push({ id: "cuda", label: "CUDA GPU", reason: backendValidationErrors[cudaPath] || cudaSelection.reason || "Installed, but CUDA backend validation failed." });
   }
   if (rocmInstalled && !rocmAvailable) {
     unavailable.push({ id: "rocm", label: "ROCm GPU (AMD)", reason: "Installed, but ROCm backend validation failed." });
@@ -3272,7 +3418,7 @@ function getBackendOptions() {
   } else if (metalAvailable) {
     defaultBackend = "metal";
   } else if (cudaAvailable) {
-    const gpuName = String(getGpuInfo().name).toLowerCase();
+    const gpuName = String(cudaSelection.device.name || "").toLowerCase();
     const isGtxCard = gpuName.includes("gtx");
     if (isGtxCard && vulkanAvailable) {
       defaultBackend = "vulkan"; // Default to Vulkan for GTX cards because of lack of Tensor Cores
@@ -3285,6 +3431,24 @@ function getBackendOptions() {
     defaultBackend = "vulkan";
   }
 
+  // Record the devices that were actually initialized, for the launch path.
+  cachedVulkanSelection = vulkanAvailable && vulkanSelection.device && Number.isInteger(vulkanSelection.device.index)
+    ? { index: vulkanSelection.device.index, cliName: `vulkan${vulkanSelection.device.index}`, name: vulkanSelection.device.name }
+    : null;
+  cachedCudaSelection = cudaAvailable && cudaSelection.device && Number.isInteger(cudaSelection.device.index)
+    ? { index: cudaSelection.device.index, cliName: `cuda${cudaSelection.device.index}`, name: cudaSelection.device.name }
+    : null;
+
+  const fallbackReason = defaultBackend === "cpu" && (cudaInstalled || vulkanInstalled)
+    ? describeGpuFallback({ cuda: cudaSelection, vulkan: vulkanSelection })
+    : null;
+
+  console.log(`  [gpu] ${describeSelectionForLog("CUDA", "cuda", cudaSelection)}`);
+  console.log(`  [gpu] ${describeSelectionForLog("Vulkan", "vulkan", vulkanSelection)}`);
+  console.log(`  [gpu] Default image backend: ${defaultBackend}${fallbackReason ? ` - ${fallbackReason}` : ""}`);
+
+  cachedBackendOptionsNegative = defaultBackend === "cpu" && (cudaInstalled || vulkanInstalled);
+  cachedBackendOptionsAt = Date.now();
   cachedBackendOptions = {
     options,
     unavailable,
@@ -3297,34 +3461,64 @@ function getBackendOptions() {
     openvinoModels,
     coremlNpu,
     defaultBackendType: defaultBackend,
+    selection: {
+      cuda: summarizeBackendSelection(cudaSelection),
+      vulkan: summarizeBackendSelection(vulkanSelection),
+      fallbackReason,
+      gpus: discovery.inventory
+        ? discovery.inventory.map((device) => ({
+          name: device.name,
+          vendor: device.vendor,
+          integrated: device.integrated ?? null,
+          vramGb: device.vramGb ?? null,
+          displayAttached: device.displayAttached ?? null,
+        }))
+        : null,
+      nvidiaSmi: {
+        ok: discovery.nvidiaSmi.ok,
+        error: discovery.nvidiaSmi.error,
+        devices: discovery.nvidiaSmi.devices.map((device) => ({
+          index: device.index,
+          name: device.name,
+          vramGb: device.vramGb,
+          displayActive: device.displayActive,
+        })),
+      },
+    },
   };
   return cachedBackendOptions;
 }
 
-function backendAccepts(binaryPath, backendName) {
-  if (!binaryPath || !fs.existsSync(binaryPath)) return false;
+// Initializes a backend on one device. The model path is intentionally missing, so the backend
+// exits after creating its device context. "loading model" is printed only after that point.
+// notFound means the device index does not exist on this machine.
+function probeBackendDevice(binaryPath, backendName, cliBackendName = null) {
+  if (!binaryPath || !fs.existsSync(binaryPath)) {
+    return { accepted: false, reason: "The backend executable is missing." };
+  }
   try {
     delete backendValidationErrors[binaryPath];
-    const cliBackendName = backendName === "cuda"
+    const cliName = cliBackendName || (backendName === "cuda"
       ? "cuda0"
       : backendName === "vulkan"
         ? getPreferredVulkanBackendName()
         : backendName === "rocm"
           ? "rocm0"
-          : backendName;
+          : backendName);
     let probeArgs = [
-      "--backend", cliBackendName,
-      "--params-backend", cliBackendName,
+      "--backend", cliName,
+      "--params-backend", cliName,
       "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
       "--listen-port", "18082",
     ];
-    if (cliBackendName === "metal") {
+    if (cliName === "metal") {
       probeArgs = [
         "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
         "--listen-port", "18082",
       ];
     }
     const spawnEnv = { ...process.env };
+    if (backendName === "cuda") Object.assign(spawnEnv, backendDeviceArgs("cuda", 0).env);
     if (osPlatform === "linux") {
       const dir = path.dirname(binaryPath);
       const existing = spawnEnv.LD_LIBRARY_PATH || "";
@@ -3335,20 +3529,28 @@ function backendAccepts(binaryPath, backendName) {
       spawnEnv.DYLD_LIBRARY_PATH = dir + (existing ? ":" + existing : "");
     }
     let result = spawnSync(binaryPath, probeArgs, { env: spawnEnv, encoding: "utf8", timeout: 5000 });
+    if (result.error) {
+      return {
+        accepted: false,
+        reason: result.error.code === "ETIMEDOUT"
+          ? "The probe timed out after 5 seconds."
+          : `The backend could not be started (${result.error.code || result.error.message}).`,
+      };
+    }
     let output = `${result.stdout || ""}\n${result.stderr || ""}`;
     const unsignedExitCode = Number(result.status) >>> 0;
     if (osPlatform === "win32" && unsignedExitCode === 0xC0000135) {
       backendValidationErrors[binaryPath] = "Windows could not start this backend because a required DLL is missing (0xC0000135). Run scripts/setup/setup.ps1 to install the Microsoft Visual C++ runtime and repair the backend.";
-      return false;
+      return { accepted: false, reason: backendValidationErrors[binaryPath] };
     }
     if (osPlatform === "win32" && unsignedExitCode === 0xC000001D) {
       backendValidationErrors[binaryPath] = "This Windows backend used a CPU instruction that this processor does not support (0xC000001D). Run scripts/setup/setup.ps1 to replace it with the runtime-dispatched backend build.";
-      return false;
+      return { accepted: false, reason: backendValidationErrors[binaryPath] };
     }
 
     let supportsFlags = true;
-    // Some binaries do not support --backend. If we see "unknown argument",
-    // retry without backend flags so we can still verify the binary launches.
+    // Some binaries do not support --backend. If we see "unknown argument", retry without
+    // device flags so we can still verify the binary launches. Its device is then not pinned.
     if (output.includes("unknown argument") && output.includes("--backend")) {
       supportsFlags = false;
       const fallbackArgs = [
@@ -3360,22 +3562,37 @@ function backendAccepts(binaryPath, backendName) {
     }
 
     const lower = output.toLowerCase();
-    if (lower.includes("backend config failed") || output.includes(`backend '${backendName}' was not found`) || output.includes(`backend '${cliBackendName}' was not found`)) {
-      return false;
+    if (/backend '[^']*' was not found/i.test(output)) {
+      return { accepted: false, notFound: true, supportsFlags, output, reason: `Device ${cliName} is not present.` };
+    }
+    if (lower.includes("backend config failed")) {
+      return { accepted: false, supportsFlags, output, reason: findFirstErrorLine(output) || `Backend ${cliName} could not be configured.` };
     }
     // Reject binaries that fail at the dynamic linker / glibc level.
     if (lower.includes("glibc") || lower.includes("libc.so") || lower.includes("libstdc++") || lower.includes("cannot open shared object")) {
-      return false;
+      return { accepted: false, supportsFlags, output, reason: findFirstErrorLine(output) || "A required shared library is missing or incompatible." };
     }
     // A healthy binary prints project-specific log lines when it tries to load the model.
-    const isOk = lower.includes("stable-diffusion.cpp") || lower.includes("loading model");
+    const deviceFailure = /failed to (create|init|initialize)|unable to (create|init)|no (usable )?(vulkan|cuda) devices/i.test(output);
+    const isOk = lower.includes("loading model") || (lower.includes("stable-diffusion.cpp") && !deviceFailure);
     if (isOk) {
       backendSupportsFlags[binaryPath] = supportsFlags;
+      return { accepted: true, supportsFlags, output };
     }
-    return isOk;
-  } catch (_) {
-    return false;
+    return {
+      accepted: false,
+      supportsFlags,
+      output,
+      reason: findFirstErrorLine(output) || `The backend exited with code ${result.status} before loading a model.`,
+    };
+  } catch (error) {
+    return { accepted: false, reason: `The probe failed: ${error.message}` };
   }
+}
+
+// Boolean view of a probe, kept for the rocm path and existing callers.
+function backendAccepts(binaryPath, backendName) {
+  return probeBackendDevice(binaryPath, backendName).accepted === true;
 }
 
 function selectBackendPath(useGpu, backendType = "auto", modelPath = "") {
@@ -3429,7 +3646,15 @@ function resolveBackendType(useGpu, backendType = "auto", modelPath = "") {
   }
 
   const available = new Set(options.options.map(option => option.id));
-  return available.has(requestedType) ? requestedType : options.defaultBackendType;
+  const unavailableReasons = Object.fromEntries((options.unavailable || []).map(item => [item.id, item.reason]));
+  const choice = resolveRequestedBackend({
+    requested: requestedType,
+    available,
+    defaultType: options.defaultBackendType,
+    unavailableReasons,
+  });
+  if (useGpu !== false) backendRequestNote = choice.reason;
+  return choice.resolved;
 }
 
 function getBackendMode(backendPath, useGpu, backendType = "auto") {
@@ -4565,6 +4790,7 @@ async function startBackend(settings = {}) {
   let args = [];
   const requestedBackend = resolveBackendType(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
   const selectedVulkanBackend = requestedBackend === "vulkan" ? getPreferredVulkanBackendName() : "";
+  const selectedCudaBackend = requestedBackend === "cuda" ? getPreferredCudaBackendName() : "";
 
   const supportsFlags = backendSupportsFlags[backendPath] !== false;
 
@@ -4598,7 +4824,7 @@ async function startBackend(settings = {}) {
     args.push("--rng", "cpu", "--sampler-rng", "cpu");
   } else if (requestedBackend === "cuda") {
     if (supportsFlags) {
-      args.push("--backend", "cuda0", "--params-backend", "cuda0");
+      args.push("--backend", selectedCudaBackend, "--params-backend", selectedCudaBackend);
     }
     args.push("--rng", "cuda", "--sampler-rng", "cuda");
   } else if (requestedBackend === "rocm") {
@@ -4612,9 +4838,13 @@ async function startBackend(settings = {}) {
 
   }
 
-  if (requestedBackend === "vulkan" && selectedVulkanBackend) {
-    currentSettings.backendDevice = selectedVulkanBackend;
-    backendLoadState.device = selectedVulkanBackend;
+  const selectedBackendDevice = requestedBackend === "cuda" || requestedBackend === "vulkan"
+    ? getSelectedBackendDeviceSummary(requestedBackend)
+    : null;
+  if (selectedBackendDevice) {
+    const label = formatBackendDeviceLabel(selectedBackendDevice.name, selectedBackendDevice.cliName);
+    currentSettings.backendDevice = label;
+    backendLoadState.device = label;
   }
 
   if (requestedBackend !== "apple-npu") {
@@ -4636,6 +4866,7 @@ async function startBackend(settings = {}) {
   // Build environment for Linux backends so bundled .so libraries are found.
   // Official Linux releases ship libstable-diffusion.so next to the executable.
   const spawnEnv = { ...process.env };
+  if (requestedBackend === "cuda") Object.assign(spawnEnv, backendDeviceArgs("cuda", 0).env);
   if (osPlatform === "linux") {
     const extraLibs = [];
     if (requestedBackend === "rocm") {
@@ -4757,10 +4988,14 @@ async function startBackend(settings = {}) {
       backendError = runtimeLinkerError;
       backendLoadState.phase = "Linux runtime is too old for this backend";
     }
-    const deviceMatch = cleanOutput.match(/Device\s+\d+:\s*([^,\r\n]+)/);
-    if (deviceMatch) {
-      backendLoadState.device = deviceMatch[1].trim();
-      currentSettings.backendDevice = backendLoadState.device;
+    // Accept a device line only if it names the device this process was started with.
+    if (selectedBackendDevice && Number.isInteger(selectedBackendDevice.index)) {
+      const loggedName = findDeviceNameInLog(cleanOutput, requestedBackend, selectedBackendDevice.index);
+      if (loggedName) {
+        const label = formatBackendDeviceLabel(loggedName, selectedBackendDevice.cliName);
+        backendLoadState.device = label;
+        currentSettings.backendDevice = label;
+      }
     }
     const metalDeviceMatch = cleanOutput.match(/GPU name:\s*([^\r\n]+)/);
     if (metalDeviceMatch) {
@@ -6803,8 +7038,9 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   }
 
   // GET /api/backend-options
-  if (req.url === "/api/backend-options" && req.method === "GET") {
-    return json(res, 200, getBackendOptions());
+  if (req.url.split("?")[0] === "/api/backend-options" && req.method === "GET") {
+    const refresh = /[?&]refresh=1(?:&|$)/.test(req.url);
+    return json(res, 200, getBackendOptions({ refresh }));
   }
 
   // GET /api/telemetry
@@ -7033,6 +7269,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       ...generationState,
       backendMode: generationState.backendMode || currentSettings.backendMode || "",
       backendDevice: generationState.backendDevice || currentSettings.backendDevice || "",
+      backendNote: backendRequestNote || (cachedBackendOptions && cachedBackendOptions.selection && cachedBackendOptions.selection.fallbackReason) || "",
     });
   }
 
