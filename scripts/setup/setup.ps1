@@ -250,7 +250,7 @@ $steps = 8
 # ── Step 1: Portable Node.js ──────────────────────────────────────────────────
 Print-Step 1 $steps "Setting up portable Node.js (app/tools/node-win/)"
 
-$expectedNodeVersion = "v22.23.2"
+$expectedNodeVersion = "v22.23.3"
 
 function Test-PortableNodeRuntime {
     param([string]$ExpectedVersion)
@@ -299,9 +299,9 @@ if (-not $nodeReady) {
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
     $ok = Invoke-RichDownload `
-        -Url  "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip" `
+        -Url  "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip" `
         -Dest $nodeZip `
-        -Label "Node.js v22.23.2 LTS (Portable ZIP)"
+        -Label "Node.js v22.23.3 LTS (Portable ZIP)"
 
     if (-not $ok) { Print-Fail "Cannot download Node.js."; Read-Host; exit 1 }
 
@@ -632,11 +632,14 @@ if (-not $?) {
     Read-Host; exit 1
 }
 
-Print-Step 5 $steps "Setting up Kokoro ONNX text-to-speech runtime"
-& (Join-Path $scriptDir "setup-tts.ps1")
-if (-not $?) {
-    Print-Fail "Kokoro TTS setup failed."
-    Read-Host; exit 1
+Print-Step 5 $steps "Setting up optional Kokoro ONNX text-to-speech runtime"
+try {
+    & (Join-Path $scriptDir "setup-tts.ps1")
+    if (-not $?) {
+        Print-Warn "Kokoro TTS setup failed. Continuing without text-to-speech; image and text features can still be tested."
+    }
+} catch {
+    Print-Warn "Kokoro TTS setup failed. Continuing without text-to-speech. $($_.Exception.Message)"
 }
 
 $npu = Get-IntelOpenVinoNpu
