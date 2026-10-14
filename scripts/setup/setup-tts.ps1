@@ -45,10 +45,23 @@ try {
     $env:ONNXRUNTIME_NODE_INSTALL_CUDA = "skip"
     $installMode = if (Test-Path (Join-Path $runtimeDir "package-lock.json")) { "ci" } else { "install" }
     Print-Info "Installing kokoro-js dependencies into app/tts-runtime..."
-    & $npmCmd $installMode --prefer-online --no-audit --no-fund --loglevel=error
-    if ($LASTEXITCODE -ne 0) {
-        $npmExitCode = $LASTEXITCODE
-        $message = "kokoro-js install failed with npm exit code $npmExitCode."
+    # Capture npm stderr/stdout so an optional TTS failure does not flood the setup
+    # console with a long red stack trace. npm still records its detailed debug log.
+    $npmOutput = & $npmCmd $installMode --prefer-online --no-audit --no-fund --loglevel=error 2>&1
+    $npmExitCode = $LASTEXITCODE
+    if ($npmExitCode -ne 0) {
+        $npmLogPath = ""
+        foreach ($line in $npmOutput) {
+            if ([string]$line -match "A complete log of this run can be found in:\\s*(.+)$") {
+                $npmLogPath = $Matches[1].Trim()
+            }
+        }
+        $message = "kokoro-js install failed (npm exit code $npmExitCode)."
+        if ($npmLogPath) {
+            $message += " Details: $npmLogPath"
+        } else {
+            $message += " Check npm's debug log under $env:LOCALAPPDATA\\npm-cache\\_logs."
+        }
         Print-Fail $message
         throw $message
     }
