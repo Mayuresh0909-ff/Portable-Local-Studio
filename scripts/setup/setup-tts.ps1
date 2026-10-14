@@ -25,8 +25,9 @@ Write-Host ""
 New-Item -ItemType Directory -Force -Path $runtimeDir, $modelsDir, $outputsDir, $cacheDir | Out-Null
 
 if (-not (Test-Path $nodeExe) -or -not (Test-Path $npmCmd)) {
-    Print-Fail "Portable Node.js is missing. Run scripts/setup/setup.ps1 first."
-    exit 1
+    $message = "Portable Node.js is missing. Run scripts/setup/setup.ps1 first."
+    Print-Fail $message
+    throw $message
 }
 
 $packageJson = Join-Path $runtimeDir "package.json"
@@ -46,8 +47,10 @@ try {
     Print-Info "Installing kokoro-js dependencies into app/tts-runtime..."
     & $npmCmd $installMode --prefer-online --no-audit --no-fund --loglevel=error
     if ($LASTEXITCODE -ne 0) {
-        Print-Fail "kokoro-js install failed."
-        exit 1
+        $npmExitCode = $LASTEXITCODE
+        $message = "kokoro-js install failed with npm exit code $npmExitCode."
+        Print-Fail $message
+        throw $message
     }
 } finally {
     $env:PATH = $oldPath
