@@ -1483,6 +1483,33 @@ if (osPlatform === "darwin") {
   setInterval(pollMacRam, 5000);
 }
 
+// Explicit refresh for the host-hardware view. These caches describe hardware inventory and
+// telemetry; they are deliberately separate from the device used by the last image generation.
+function refreshHardwareDiscoveryState() {
+  cachedGpuInfo = null;
+  cachedGpuDiscovery = null;
+  cachedLlamaCudaGpu = null;
+  cachedLlamaCudaGpuChecked = false;
+  cachedLlamaVulkanGpu = null;
+  cachedLlamaVulkanGpuChecked = false;
+  cachedLlamaSyclGpu = null;
+  cachedLlamaSyclGpuChecked = false;
+  cachedBackendOptions = null;
+  cachedBackendOptionsAt = 0;
+  cachedBackendOptionsNegative = false;
+  cachedVulkanSelection = null;
+  cachedCudaSelection = null;
+  cachedVramInfo = null;
+  cachedLlamaVramInfo = null;
+  hasNvidiaSmi = null;
+  lastVramPollTime = 0;
+  lastLlamaVramPollTime = 0;
+  cachedNpuInfo = null;
+  cachedHasNpuHardware = null;
+  pollNvidiaVram(true);
+  pollLlamaVram(true);
+}
+
 function getHardwareSpecs() {
   const cpus = os.cpus();
   const gpu = getGpuInfo();
@@ -7049,8 +7076,10 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return json(res, 200, { ok: true, recommendations, source: recommendations ? "llmfit" : "fallback" });
   }
 
-  // GET /api/hardware-specs
-  if (req.url === "/api/hardware-specs" && req.method === "GET") {
+  // GET /api/hardware-specs?refresh=1
+  if (req.url.split("?")[0] === "/api/hardware-specs" && req.method === "GET") {
+    const refresh = /[?&]refresh=1(?:&|$)/.test(req.url);
+    if (refresh) refreshHardwareDiscoveryState();
     return json(res, 200, getHardwareSpecs());
   }
 
