@@ -138,12 +138,15 @@ export async function getHardwareSpecs({ refresh = false } = {}) {
   if (isLocalServerMode()) {
     try {
       const res = await fetch(`/api/hardware-specs${refresh ? "?refresh=1" : ""}`);
-      if (res.ok) {
-        cachedSpecs = await res.json();
-        return cachedSpecs;
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Hardware detection failed (HTTP ${res.status})`);
       }
+      cachedSpecs = data;
+      return cachedSpecs;
     } catch (e) {
       console.warn("Failed to get hardware specs from local server:", e);
+      if (refresh) throw e;
     }
   }
 
