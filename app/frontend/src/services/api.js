@@ -162,6 +162,13 @@ export async function getHardwareSpecs({ refresh = false } = {}) {
   return cachedSpecs;
 }
 
+// Current image-backend selection as reported by the server; not inferred from host inventory.
+export async function getGenerationProgress() {
+  const res = await fetch("/api/generation-progress");
+  if (!res.ok) throw new Error(`Generation status request failed (HTTP ${res.status})`);
+  return await res.json();
+}
+
 // Get CPU/RAM/VRAM real-time utilization
 export async function getTelemetry() {
   if (isTauri()) {
