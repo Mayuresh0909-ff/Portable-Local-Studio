@@ -1486,6 +1486,12 @@ if (osPlatform === "darwin") {
 // Explicit refresh for the host-hardware view. These caches describe hardware inventory and
 // telemetry; they are deliberately separate from the device used by the last image generation.
 function refreshHardwareDiscoveryState() {
+  // Avoid probing drivers or clearing the selected-device record while either model runtime is
+  // running. The UI disables this action in that state; the server also enforces it for API callers.
+  if (backendProc !== null || llmProc !== null) {
+    throw new Error("Stop the active image or text model before refreshing hardware detection.");
+  }
+
   cachedGpuInfo = null;
   cachedGpuDiscovery = null;
   cachedLlamaCudaGpu = null;
@@ -7079,7 +7085,13 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   // GET /api/hardware-specs?refresh=1
   if (req.url.split("?")[0] === "/api/hardware-specs" && req.method === "GET") {
     const refresh = /[?&]refresh=1(?:&|$)/.test(req.url);
-    if (refresh) refreshHardwareDiscoveryState();
+    if (refresh) {
+      try {
+        refreshHardwareDiscoveryState();
+      } catch (err) {
+        return json(res, 409, { ok: false, error: err.message || String(err) });
+      }
+    }
     return json(res, 200, getHardwareSpecs());
   }
 
