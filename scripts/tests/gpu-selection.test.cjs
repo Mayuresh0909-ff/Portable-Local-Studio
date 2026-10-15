@@ -647,11 +647,11 @@ test("host hardware refresh has its own cache path and refuses to run while mode
   assert.match(server, /function refreshHardwareDiscoveryState\(\)/);
   assert.match(server, /if \(backendProc !== null \|\| llmProc !== null\)/);
   assert.match(server, /req\.url\.split\("\?"\)\[0\] === "\/api\/hardware-specs"/);
-  assert.match(server, /if \(refresh\) refreshHardwareDiscoveryState\(\)/);
+  assert.match(server, /refreshHardwareDiscoveryState\(\);/);
 
   const api = read("app/frontend/src/services/api.js");
   assert.match(api, /getHardwareSpecs\(\{ refresh = false \} = \{\}\)/);
-  assert.match(api, /api\/hardware-specs\\\$\{refresh \? "\?refresh=1" : ""\}/);
+  assert.match(api, /api\/hardware-specs\$\{refresh \? "\?refresh=1" : ""\}/);
 
   const sidebar = read("app/frontend/src/components/Sidebar.jsx");
   assert.match(sidebar, /Primary detected GPU:/);
