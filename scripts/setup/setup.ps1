@@ -305,18 +305,33 @@ if (-not $nodeReady) {
 
     if (-not $ok) { Print-Fail "Cannot download Node.js."; Read-Host; exit 1 }
 
-    Expand-WithProgress -ZipPath $nodeZip -Destination $toolsDir -Label "Node.js"
-    Remove-Item $nodeZip -Force
+    # The repository may be extracted deep under Downloads or on a USB drive.
+    # Extract Node.js under TEMP first: npm's deeply nested package paths can exceed
+    # Windows' traditional 260-character path limit when extracted under the project.
+    $nodeExtractRoot = Join-Path $env:TEMP ("pls-node-extract-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        Expand-WithProgress -ZipPath $nodeZip -Destination $nodeExtractRoot -Label "Node.js"
 
-    $extracted = Get-ChildItem $toolsDir -Directory | Where-Object { $_.Name -like "node-v*" } | Select-Object -First 1
-    if ($extracted) {
+        $extracted = Get-ChildItem $nodeExtractRoot -Directory |
+            Where-Object { $_.Name -eq "node-v22.23.3-win-x64" } |
+            Select-Object -First 1
+        if (-not $extracted) {
+            throw "The Node.js ZIP did not contain the expected node-v22.23.3-win-x64 directory."
+        }
+
         if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
-        Rename-Item $extracted.FullName "node-win"
+        Copy-Item -LiteralPath $extracted.FullName -Destination $nodeDir -Recurse -Force
+        if (-not (Test-Path $nodeExe) -or -not (Test-Path $npmCmd)) {
+            throw "Node.js files were extracted but could not be copied into app/tools/node-win."
+        }
+    } finally {
+        Remove-Item $nodeExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $nodeZip -Force -ErrorAction SilentlyContinue
     }
 
-    # Pause briefly to allow USB drive writes to flush
+    # Pause briefly to allow disk writes to flush
     Print-Info "Waiting for disk to flush..."
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 1
 
     # Re-verify
     $nodeReady = $false
