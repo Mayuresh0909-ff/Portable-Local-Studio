@@ -320,7 +320,9 @@ if (-not $nodeReady) {
         }
 
         if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
-        Copy-Item -LiteralPath $extracted.FullName -Destination $nodeDir -Recurse -Force
+        New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
+        Get-ChildItem -LiteralPath $extracted.FullName -Force |
+            Copy-Item -Destination $nodeDir -Recurse -Force
         if (-not (Test-Path $nodeExe) -or -not (Test-Path $npmCmd)) {
             throw "Node.js files were extracted but could not be copied into app/tools/node-win."
         }
