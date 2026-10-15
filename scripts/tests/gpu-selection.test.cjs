@@ -640,3 +640,24 @@ test("the GPU selection module has no process, filesystem, or network access", (
   const source = read("scripts/server/gpu-selection.cjs");
   assert.doesNotMatch(source, /require\("(child_process|fs|net|http|https)"\)/);
 });
+
+
+test("host hardware refresh has its own cache path and refuses to run while model runtimes are active", () => {
+  const server = read("scripts/server/serve.cjs");
+  assert.match(server, /function refreshHardwareDiscoveryState\(\)/);
+  assert.match(server, /if \(backendProc !== null \|\| llmProc !== null\)/);
+  assert.match(server, /req\.url\.split\("\?"\)\[0\] === "\/api\/hardware-specs"/);
+  assert.match(server, /if \(refresh\) refreshHardwareDiscoveryState\(\)/);
+
+  const api = read("app/frontend/src/services/api.js");
+  assert.match(api, /getHardwareSpecs\(\{ refresh = false \} = \{\}\)/);
+  assert.match(api, /api\/hardware-specs\\\$\{refresh \? "\?refresh=1" : ""\}/);
+
+  const sidebar = read("app/frontend/src/components/Sidebar.jsx");
+  assert.match(sidebar, /Primary detected GPU:/);
+  assert.match(sidebar, /disabled=\{!canRefreshSpecs \|\| isRefreshingSpecs\}/);
+
+  const topBar = read("app/frontend/src/components/TopStatusBar.jsx");
+  assert.match(topBar, /Last image device:/);
+  assert.match(topBar, /not necessarily the active inference device/);
+});
