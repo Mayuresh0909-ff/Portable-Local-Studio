@@ -16,7 +16,8 @@ const truncateModelName = (name) => {
 };
 
 function TopStatusBar({ 
-  telemetry, 
+  telemetry,
+  imageBackendStatus = { backendMode: "", backendDevice: "", active: false },
   serverRunning, 
   activeModel, 
   isLlmLoaded = false, 
@@ -61,6 +62,10 @@ function TopStatusBar({
   };
 
   const isDark = (theme || "dark").startsWith("dark");
+  const imageDevice = String(imageBackendStatus?.backendDevice || "").trim();
+  const shortImageDevice = imageDevice
+    .replace(/^NVIDIA GeForce /i, "")
+    .replace(/^AMD Radeon\(TM\) /i, "");
 
   return (
     <div className="top-status-bar">
@@ -164,9 +169,19 @@ function TopStatusBar({
           <span>RAM: {formatGb(telemetry.ram_used_gb)} / {formatGb(telemetry.ram_total_gb)} GB</span>
         </div>
 
-        {/* GPU VRAM Telemetry Chip */}
+        {/* Device selected for image inference is shown separately from host/GPU memory telemetry. */}
+        {imageDevice && (
+          <div
+            className="telemetry-chip"
+            title={`${activeModel ? "Selected image backend device" : "Last reported image backend device"}: ${imageDevice} (${imageBackendStatus.backendMode || "backend not identified"})`}
+          >
+            <span>{activeModel ? "Image device:" : "Last image device:"} {shortImageDevice}</span>
+          </div>
+        )}
+
+        {/* GPU VRAM telemetry reports memory usage, not which device ran image inference. */}
         {telemetry.vram_total_gb > 0 && (
-          <div className="telemetry-chip" title={`${telemetry.gpu_name} VRAM`}>
+          <div className="telemetry-chip" title={`${telemetry.gpu_name} VRAM usage; not necessarily the active inference device`}>
             <span>VRAM: {formatGb(telemetry.vram_used_gb, { allowZero: true })} / {formatGb(telemetry.vram_total_gb)} GB</span>
           </div>
         )}
