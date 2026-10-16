@@ -19,6 +19,24 @@ function Enable-Tls12 {
     }
 }
 
+# Pinned SHA-256 for ggml-org/whisper.cpp release v1.9.1 asset whisper-bin-x64.zip
+# (GitHub release-asset metadata, api.github.com/repos/ggml-org/whisper.cpp/releases/tags/v1.9.1).
+# A -Release value without an entry here makes the install fail closed.
+$whisperSha256ByRelease = @{
+    "v1.9.1" = "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539"
+}
+
+function Assert-FileSha256 {
+    param([string]$Path, [string]$ExpectedSha256, [string]$Label)
+    Write-Host "   >>  Verifying SHA-256: $Label"
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 mismatch for $Label. Expected $ExpectedSha256 but got $actual. The download was deleted and was not extracted or run."
+    }
+    Write-Host "   OK  SHA-256 verified: $Label"
+}
+
 function Download-File {
     param([string]$Url, [string]$DestPath, [string]$Label)
     Write-Host "   >>  Downloading $Label..."
@@ -73,9 +91,13 @@ $asset = "whisper-bin-x64.zip"
 $archive = Join-Path $toolsDir $asset
 $extract = Join-Path $toolsDir "whisper-extract"
 $url = "https://github.com/ggml-org/whisper.cpp/releases/download/$Release/$asset"
+if (-not $whisperSha256ByRelease.ContainsKey($Release)) {
+    throw "No pinned SHA-256 for whisper.cpp release $Release. Refusing to download an unverified archive."
+}
 
 Remove-Item $archive, $extract -Recurse -Force -ErrorAction SilentlyContinue
 Download-File -Url $url -DestPath $archive -Label "whisper.cpp speech backend ($Release)"
+Assert-FileSha256 -Path $archive -ExpectedSha256 $whisperSha256ByRelease[$Release] -Label "$asset ($Release)"
 
 Write-Host "   >>  Extracting whisper.cpp speech backend..."
 Expand-Archive -Path $archive -DestinationPath $extract -Force

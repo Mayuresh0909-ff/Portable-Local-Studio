@@ -191,6 +191,29 @@ function Expand-WithProgress {
     Write-Host ""
 }
 
+function Assert-FileSha256 {
+    param([string]$Path, [string]$ExpectedSha256, [string]$Label)
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "No pinned SHA-256 is configured for $Label. Refusing to use an unverified download."
+    }
+    Print-Info "Verifying SHA-256: $Label"
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 mismatch for $Label. Expected $ExpectedSha256 but got $actual. The download was deleted and was not extracted or run. Re-run setup; if it fails again, the upstream release asset may have changed."
+    }
+    Print-OK "SHA-256 verified: $Label"
+}
+
+# Pinned SHA-256 digests for the release assets downloaded below. Source: the
+# GitHub release-asset metadata (api.github.com/repos/<owner>/<repo>/releases/tags/<tag>)
+# of the upstream repositories leejet/stable-diffusion.cpp. Update these together with the URLs.
+$sdCpuSha256    = "38da3539d3af6918f4c218fd198ac6e26cd71249e54feb3a491d184d3ca94ea0"  # master-782-b290693 sd-master-b290693-bin-win-cpu-x64.zip
+$sdCudaSha256   = "bc7aa2f6d471b324bfbc76f108a5cb3b76de29cb892d12609647e11b041f8a02"  # master-782-b290693 sd-master-b290693-bin-win-cuda12-x64.zip
+$sdCudartSha256 = "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d"  # master-782-b290693 cudart-sd-bin-win-cu12-x64.zip
+$sdVulkanSha256 = "7a0c0a9c3f5a23079174e6f18965177077faeaa7745fcf03c1fc81ae995c14be"  # master-685-19bdfe2 sd-master-19bdfe2-bin-win-vulkan-x64.zip
+
 function Ensure-VisualCppRuntime {
     $requiredDlls = @(
         "VCRUNTIME140.dll",
@@ -397,6 +420,7 @@ if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll) -and ($installedC
         -Label "stable-diffusion.cpp CPU Backend (Windows x64, runtime dispatch)"
 
     if (-not $ok) { Print-Fail "Cannot download CPU backend binaries."; Read-Host; exit 1 }
+    Assert-FileSha256 -Path $cpuBackendZip -ExpectedSha256 $sdCpuSha256 -Label "stable-diffusion.cpp CPU backend (master-782-b290693)"
 
     $tempExt = Join-Path $toolsDir "sd-cpu-temp"
     Expand-WithProgress -ZipPath $cpuBackendZip -Destination $tempExt -Label "CPU Backend"
@@ -454,6 +478,14 @@ if ($hasNvidia) {
             -Dest $backendZip `
             -Label "stable-diffusion.cpp CUDA 12.8 Backend (Windows x64)"
 
+        if ($ok) {
+            try {
+                Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdCudaSha256 -Label "stable-diffusion.cpp CUDA 12.8 backend (master-782-b290693)"
+            } catch {
+                Print-Warn $_.Exception.Message
+                $ok = $false
+            }
+        }
         if (-not $ok) {
             Print-Warn "Cannot download CUDA backend binaries. Continuing with the Vulkan backend fallback."
         } else {
@@ -505,6 +537,14 @@ if ($hasNvidia) {
                 -Label "CUDA 12.8 Runtime DLLs (stable-diffusion.cpp)"
 
             if ($ok) {
+                try {
+                    Assert-FileSha256 -Path $dllZip -ExpectedSha256 $sdCudartSha256 -Label "CUDA 12.8 runtime DLLs (master-782-b290693)"
+                } catch {
+                    Print-Warn $_.Exception.Message
+                    $ok = $false
+                }
+            }
+            if ($ok) {
                 Expand-WithProgress -ZipPath $dllZip -Destination $backendDest -Label "CUDA Runtime DLLs"
                 Remove-Item $dllZip -Force
                 Print-OK "CUDA runtime DLLs set up successfully!"
@@ -543,6 +583,7 @@ if ($hasNvidia) {
             -Label "stable-diffusion.cpp Vulkan Backend (Windows x64)"
 
         if (-not $ok) { Print-Fail "Cannot download Vulkan backend binaries."; Read-Host; exit 1 }
+        Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdVulkanSha256 -Label "stable-diffusion.cpp Vulkan backend (master-685-19bdfe2)"
 
         $tempExt = Join-Path $toolsDir "sd-vulkan-temp"
         Expand-WithProgress -ZipPath $backendZip -Destination $tempExt -Label "Vulkan Backend"
@@ -598,6 +639,7 @@ if ($hasNvidia) {
             -Label "stable-diffusion.cpp Vulkan Backend (Windows x64)"
 
         if (-not $ok) { Print-Fail "Cannot download Vulkan backend binaries."; Read-Host; exit 1 }
+        Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdVulkanSha256 -Label "stable-diffusion.cpp Vulkan backend (master-685-19bdfe2)"
 
         $tempExt = Join-Path $toolsDir "sd-vulkan-temp"
         Expand-WithProgress -ZipPath $backendZip -Destination $tempExt -Label "Vulkan Backend"
