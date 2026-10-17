@@ -122,6 +122,29 @@ Only run this if it can be done safely. Do not remove the driver or edit system 
    message. Vulkan selection is unaffected by the CUDA result, and a usable Vulkan device is still selected.
 3. Restart normally afterward and confirm step 2 again.
 
+## 7. Evidence capture (run once, after step 0)
+
+This records the nvidia-smi devices and one missing-model probe per device. It does not load a model or
+generate an image. It writes one new JSON file and does not overwrite an earlier one.
+
+```powershell
+cd <repository folder>
+node scripts/capture-gpu-evidence.cjs
+```
+
+Check, in the printed summary and in `gpu-evidence/gpu-evidence-<time>.json`:
+
+- `nvidiaSmi.devices`: the RTX 5060 entry has `driverVersion` and `computeCap` (for Blackwell, 12.0). `null`
+  means the driver did not report the field, which is an error to note, not a pass.
+- `backends[].probes[].stage`: `primary` means the binary accepted `--backend`. `fallback` means it did not.
+- `initConfirmed`: `true` means the backend reached model loading on that device. `false` means the device
+  was not confirmed.
+- `probeError`: `timeout` or `start` means the probe never gave a verdict.
+- `hardwareVerified` is always `false`. This run does not prove that an image was generated on the GPU. Step 4
+  of this document is still required.
+
+The `gpu-evidence/` folder is git-ignored. Do not commit it, and do not paste model paths beyond the values above.
+
 ## Results table
 
 | Step | Expected | Actual (paste values) | PASS / FAIL / NOT RUN |
