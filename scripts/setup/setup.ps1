@@ -276,10 +276,12 @@ Print-Step 1 $steps "Setting up portable Node.js (app/tools/node-win/)"
 $expectedNodeVersion = "v22.23.3"
 
 function Test-PortableNodeRuntime {
-    param([string]$ExpectedVersion)
+    param([string]$ExpectedVersion, [string]$Dir = $nodeDir)
+
+    $exe = Join-Path $Dir "node.exe"
 
     try {
-        $nodeVersion = (& $nodeExe --version 2>&1 | Out-String).Trim()
+        $nodeVersion = (& $exe --version 2>&1 | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne $ExpectedVersion) {
             return $false
         }
@@ -289,7 +291,7 @@ function Test-PortableNodeRuntime {
         $smokeCache = Join-Path $env:TEMP ("pls-npm-smoke-" + [Guid]::NewGuid().ToString("N"))
         $npmExitCode = 1
         try {
-            & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") cache verify --cache $smokeCache --loglevel=error *> $null
+            & $exe (Join-Path $Dir "node_modules\npm\bin\npm-cli.js") cache verify --cache $smokeCache --loglevel=error *> $null
             $npmExitCode = $LASTEXITCODE
         } finally {
             Remove-Item $smokeCache -Recurse -Force -ErrorAction SilentlyContinue
@@ -312,10 +314,23 @@ if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
     }
 }
 
+# The active runtime is never deleted before a replacement has been downloaded, extracted,
+# copied into a staging folder, and validated. Only then is it swapped in by rename.
+$nodeStagingDir  = "$nodeDir.staging"
+$nodePreviousDir = "$nodeDir.previous"
+$nodeLeaf        = Split-Path -Leaf $nodeDir
+$nodePreviousLeaf = Split-Path -Leaf $nodePreviousDir
+
 if (-not $nodeReady) {
+    # Recover from an interrupted earlier swap: restore a set-aside copy if the active one is gone.
+    if (-not (Test-Path $nodeDir) -and (Test-Path $nodePreviousDir)) {
+        Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf
+    }
+    # Leftovers from an interrupted attempt are safe to remove. The active runtime is not.
+    Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $nodeDir) {
-        Print-Warn "Portable Node.js installation is corrupted or incomplete. Cleaning up..."
-        Remove-Item $nodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $nodePreviousDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Warn "Replacing the Portable Node.js runtime. The current copy is kept until the new one validates."
     }
 
     $nodeZip = Join-Path $toolsDir "node.zip"
@@ -330,11 +345,10 @@ if (-not $nodeReady) {
         -Dest $nodeZip `
         -Label "Node.js v22.23.3 LTS (Portable ZIP)"
 
-    if (-not $ok) { Print-Fail "Cannot download Node.js."; Read-Host; exit 1 }
+    if (-not $ok) { Print-Fail "Cannot download Node.js. The existing runtime (if any) was kept."; Read-Host; exit 1 }
 
-    # The repository may be extracted deep under Downloads or on a USB drive.
-    # Extract Node.js under TEMP first: npm's deeply nested package paths can exceed
-    # Windows' traditional 260-character path limit when extracted under the project.
+    # Extract under TEMP first: npm's deeply nested package paths can exceed the traditional
+    # 260-character limit when extracted under a deep project path.
     $nodeExtractRoot = Join-Path $env:TEMP ("pls-node-extract-" + [Guid]::NewGuid().ToString("N"))
     try {
         Expand-WithProgress -ZipPath $nodeZip -Destination $nodeExtractRoot -Label "Node.js"
@@ -346,37 +360,64 @@ if (-not $nodeReady) {
             throw "The Node.js ZIP did not contain the expected node-v22.23.3-win-x64 directory."
         }
 
-        if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
-        New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
+        # Copy into a staging folder beside the active runtime. Copy-Item errors are terminating
+        # here, so a partial copy cannot be mistaken for a complete runtime.
+        New-Item -ItemType Directory -Force -Path $nodeStagingDir | Out-Null
         Get-ChildItem -LiteralPath $extracted.FullName -Force |
-            Copy-Item -Destination $nodeDir -Recurse -Force
-        if (-not (Test-Path $nodeExe) -or -not (Test-Path $npmCmd)) {
-            throw "Node.js files were extracted but could not be copied into app/tools/node-win."
-        }
+            Copy-Item -Destination $nodeStagingDir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "Could not stage Node.js: $($_.Exception.Message)"
+        if (Test-Path $nodeDir) { Print-Fail "The existing Portable Node.js runtime was kept." }
+        Read-Host; exit 1
     } finally {
         Remove-Item $nodeExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $nodeZip -Force -ErrorAction SilentlyContinue
+    }
+
+    # Validate the staged copy before it touches the active runtime.
+    $stagedExe = Join-Path $nodeStagingDir "node.exe"
+    $stagedNpm = Join-Path $nodeStagingDir "npm.cmd"
+    $stagedOk = ((Test-Path $stagedExe) -and (Test-Path $stagedNpm) -and (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion -Dir $nodeStagingDir))
+    if (-not $stagedOk) {
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "The downloaded Node.js runtime failed validation (version or npm check). The existing runtime (if any) was kept."
+        Read-Host; exit 1
+    }
+
+    # Swap by rename. If activation fails, put the previous copy back.
+    try {
+        if (Test-Path $nodeDir) {
+            Rename-Item -LiteralPath $nodeDir -NewName $nodePreviousLeaf
+        }
+        Rename-Item -LiteralPath $nodeStagingDir -NewName $nodeLeaf
+    } catch {
+        if (-not (Test-Path $nodeDir) -and (Test-Path $nodePreviousDir)) {
+            Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "Could not activate the new Node.js runtime: $($_.Exception.Message)"
+        Print-Fail "Close any running Uncensored AI Studio windows (a running node.exe can lock app/tools/node-win), then run setup again."
+        Read-Host; exit 1
     }
 
     # Pause briefly to allow disk writes to flush
     Print-Info "Waiting for disk to flush..."
     Start-Sleep -Seconds 1
 
-    # Re-verify
-    $nodeReady = $false
-    if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
-        $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
-        $nodeReady = Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion
-    }
-
+    # Re-verify the activated runtime. Restore the previous copy if it fails.
+    $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
+    $nodeReady = (Test-Path $nodeExe) -and (Test-Path $npmCmd) -and (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion)
     if (-not $nodeReady) {
-        Print-Fail "Portable Node.js install is incomplete or corrupted. Close any running Uncensored AI Studio windows, delete app/tools/node-win, then run setup again."
+        Remove-Item -LiteralPath $nodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $nodePreviousDir) { Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf -ErrorAction SilentlyContinue }
+        Print-Fail "Portable Node.js failed validation after activation. The previous runtime was restored where available."
         Read-Host; exit 1
     }
 
+    Remove-Item -LiteralPath $nodePreviousDir -Recurse -Force -ErrorAction SilentlyContinue
     Print-OK "Portable Node.js ready: $v"
 }
-
 try {
     Ensure-VisualCppRuntime
 } catch {
