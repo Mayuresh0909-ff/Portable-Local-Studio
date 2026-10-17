@@ -39,6 +39,7 @@ const {
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
 const { inspectSafetensorsFile, warningsForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
+const { classifyBackendFailure } = require("./failure-classification.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -3003,6 +3004,7 @@ async function getHealth() {
       ready: backendReady || openvinoReady,
       running: backendProc !== null || openvinoProc !== null,
       error: backendError,
+      errorCategory: backendError ? classifyBackendFailure({ output: backendError, platform: osPlatform }) : null,
       settings: currentSettings,
       options: getBackendOptions(),
     },
@@ -6172,6 +6174,7 @@ const server = http.createServer(async (req, res) => {
       port: PORT_BACKEND,
       preferredPort: PREFERRED_BACKEND_PORT,
       error: backendError,
+      errorCategory: backendError ? classifyBackendFailure({ output: backendError, platform: osPlatform }) : null,
       loading: backendLoadState,
       unloading: backendUnloadState,
       settings: currentSettings,
