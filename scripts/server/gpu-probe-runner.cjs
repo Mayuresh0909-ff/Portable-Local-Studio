@@ -10,7 +10,10 @@ const { spawnSync } = require("node:child_process");
 const { parseNvidiaSmiCsv, findFirstErrorLine } = require("./gpu-selection.cjs");
 
 // Queries are tried in order. A driver that rejects a field name falls through to the next query.
+// The first query adds driver_version and compute_cap (compute capability, e.g. 12.0 for the
+// RTX 5060). Older drivers reject those names and use the shorter queries.
 const NVIDIA_SMI_QUERIES = [
+  "index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version,compute_cap",
   "index,name,memory.total,memory.free,display_active,pci.bus_id",
   "index,name,memory.total,memory.free", // older drivers do not know display_active
 ];

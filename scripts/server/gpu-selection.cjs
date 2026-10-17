@@ -212,8 +212,16 @@ function parseCudaDeviceLog(output) {
 }
 
 // Parses:
-//   nvidia-smi --query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id --format=csv,noheader,nounits
-// Missing or "[N/A]" fields become null. display_active is informational only.
+//   nvidia-smi --query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id[,driver_version,compute_cap]
+//              --format=csv,noheader,nounits
+// Missing or "[N/A]" fields become null. display_active is informational only. driver_version and
+// compute_cap are optional trailing columns (older drivers omit them). They are information only,
+// and selection does not use them.
+function nvidiaSmiField(value, pattern) {
+  const text = String(value === undefined || value === null ? "" : value).trim();
+  return pattern.test(text) ? text : null;
+}
+
 function parseNvidiaSmiCsv(stdout) {
   const devices = [];
   for (const line of String(stdout || "").split(/\r?\n/)) {
@@ -229,6 +237,8 @@ function parseNvidiaSmiCsv(stdout) {
       freeVramGb: mibToGb(parts[3]),
       displayActive: parseEnabledFlag(parts[4]),
       busId: parts[5] || null,
+      driverVersion: nvidiaSmiField(parts[6], /^\d+(\.\d+)+$/),
+      computeCap: nvidiaSmiField(parts[7], /^\d+\.\d+$/),
       source: "nvidia-smi",
     });
   }

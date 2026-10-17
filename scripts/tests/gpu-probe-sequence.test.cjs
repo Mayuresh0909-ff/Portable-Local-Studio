@@ -154,9 +154,30 @@ test("an explicit device error in the output rejects the device and quotes the l
 
 // ── nvidia-smi query (fake spawn) ───────────────────────────────────────────────
 
-const SMI_FULL_CSV = "0, NVIDIA GeForce RTX 5060 Laptop GPU, 8151, 7000, Disabled, 00000000:01:00.0\n";
+const SMI_FULL_CSV = "0, NVIDIA GeForce RTX 5060 Laptop GPU, 8151, 7000, Disabled, 00000000:01:00.0, 581.57, 12.0\n";
 
-test("nvidia-smi parses the full query into devices", () => {
+test("nvidia-smi CSV maps driver_version and compute_cap, and rejects malformed values", () => {
+  const devices = selection.parseNvidiaSmiCsv([
+    "0, NVIDIA GeForce RTX 5060 Laptop GPU, 8151, 7000, Disabled, 00000000:01:00.0, 581.57, 12.0",
+    "1, NVIDIA RTX A2000, [N/A], [N/A], Enabled, 00000000:02:00.0, [N/A], [N/A]",
+    "2, NVIDIA Tesla X, 1024, 900, Disabled, 00000000:03:00.0, 581.57.1-beta, 8.6.1",
+  ].join("\n"));
+  assert.equal(devices[0].driverVersion, "581.57");
+  assert.equal(devices[0].computeCap, "12.0");
+  assert.equal(devices[1].driverVersion, null);
+  assert.equal(devices[1].computeCap, null);
+  assert.equal(devices[2].computeCap, null, "a three-part capability is not a valid compute_cap value");
+  assert.equal(devices[2].driverVersion, null, "a driver string with a suffix is not accepted");
+});
+
+test("nvidia-smi CSV without the new columns (older query) still parses, with null fields", () => {
+  const devices = selection.parseNvidiaSmiCsv("0, NVIDIA GeForce RTX 3060, 12288, 11000, Enabled, 00000000:01:00.0");
+  assert.equal(devices[0].computeCap, null);
+  assert.equal(devices[0].driverVersion, null);
+  assert.equal(devices[0].busId, "00000000:01:00.0");
+});
+
+test("nvidia-smi requests the full query first, including driver and compute capability", () => {
   const calls = [];
   const spawn = (command, args) => {
     calls.push(args[0]);
@@ -168,7 +189,26 @@ test("nvidia-smi parses the full query into devices", () => {
   assert.equal(result.devices[0].name, "NVIDIA GeForce RTX 5060 Laptop GPU");
   assert.equal(result.devices[0].displayActive, false);
   assert.equal(result.devices[0].busId, "00000000:01:00.0");
-  assert.equal(calls[0], "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id");
+  assert.equal(result.devices[0].driverVersion, "581.57");
+  assert.equal(result.devices[0].computeCap, "12.0");
+  assert.equal(calls[0], "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version,compute_cap");
+  assert.equal(calls.length, 1, "no fallback query when the first one works");
+});
+
+test("a driver that rejects compute_cap falls back to the query without it, and the fields are null", () => {
+  const calls = [];
+  const spawn = (command, args) => {
+    calls.push(args[0]);
+    if (calls.length === 1) return { status: 2, stdout: "", stderr: 'Field "compute_cap" is not a valid field to query.' };
+    return { status: 0, stdout: "0, NVIDIA GeForce RTX 3060, 12288, 11000, Enabled, 00000000:01:00.0\n", stderr: "" };
+  };
+  const result = runner.queryNvidiaSmi({ platform: "linux", spawn, exists: () => true });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1], "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id");
+  assert.equal(result.ok, true);
+  assert.equal(result.devices[0].computeCap, null);
+  assert.equal(result.devices[0].driverVersion, null);
+  assert.equal(result.devices[0].displayActive, true);
 });
 
 test("nvidia-smi falls back to the smaller query when a driver rejects a field", () => {
