@@ -50,17 +50,24 @@ try {
     $npmOutput = & $npmCmd $installMode --prefer-online --no-audit --no-fund --loglevel=error 2>&1
     $npmExitCode = $LASTEXITCODE
     if ($npmExitCode -ne 0) {
+        # npm prints: "npm error A complete log of this run can be found in: C:\...\_logs\...log"
+        # The pattern is a single-quoted PowerShell string on purpose: in a double-quoted
+        # string the backslashes are not escapes, so a regex written there with doubled
+        # backslashes only matches literal double backslashes and never npm's Windows path.
+        $npmLogPattern = 'A complete log of this run can be found in:\s*(.+)$'
         $npmLogPath = ""
         foreach ($line in $npmOutput) {
-            if ([string]$line -match "A complete log of this run can be found in:\\s*(.+)$") {
+            if ([string]$line -match $npmLogPattern) {
                 $npmLogPath = $Matches[1].Trim()
             }
         }
+        # npm's default cache on Windows is %LOCALAPPDATA%\npm-cache, with debug logs in _logs.
+        $npmLogDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "npm-cache\_logs" } else { "%LOCALAPPDATA%\npm-cache\_logs" }
         $message = "kokoro-js install failed (npm exit code $npmExitCode)."
         if ($npmLogPath) {
             $message += " Details: $npmLogPath"
         } else {
-            $message += " Check npm's debug log under $env:LOCALAPPDATA\\npm-cache\\_logs."
+            $message += " Check npm's debug log under $npmLogDir."
         }
         Print-Fail $message
         throw $message
