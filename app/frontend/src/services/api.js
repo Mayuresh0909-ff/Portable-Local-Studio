@@ -122,9 +122,9 @@ export async function cleanupCandidates(ids) {
   return await readJsonResponse(res, "The local server returned invalid cleanup data.");
 }
 
-// Get CPU and GPU specifications
-export async function getHardwareSpecs() {
-  if (cachedSpecs) return cachedSpecs;
+// Get CPU and GPU specifications. Pass { refresh: true } after a hardware/driver change.
+export async function getHardwareSpecs({ refresh = false } = {}) {
+  if (cachedSpecs && !refresh) return cachedSpecs;
 
   if (isTauri()) {
     try {
@@ -137,13 +137,16 @@ export async function getHardwareSpecs() {
 
   if (isLocalServerMode()) {
     try {
-      const res = await fetch("/api/hardware-specs");
-      if (res.ok) {
-        cachedSpecs = await res.json();
-        return cachedSpecs;
+      const res = await fetch(`/api/hardware-specs${refresh ? "?refresh=1" : ""}`);
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Hardware detection failed (HTTP ${res.status})`);
       }
+      cachedSpecs = data;
+      return cachedSpecs;
     } catch (e) {
       console.warn("Failed to get hardware specs from local server:", e);
+      if (refresh) throw e;
     }
   }
 

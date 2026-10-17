@@ -70,6 +70,12 @@ test("slow image generation has no fixed proxy timeout and blocks destructive re
   assert.match(server, /if \(generationState\.active\)[\s\S]*?Image generation is in progress/);
 });
 
+test("management server listens on loopback only", () => {
+  const server = read("scripts/server/serve.cjs");
+  assert.match(server, /server\.listen\(PORT_FRONTEND, "127\.0\.0\.1"/);
+  assert.doesNotMatch(server, /\.listen\([^)]*"0\.0\.0\.0"/);
+});
+
 test("Windows OpenVINO setup only accepts Intel NPUs and remains optional", () => {
   const setup = read("scripts/setup/setup.ps1");
   const openvino = read("scripts/setup/setup-openvino-npu.ps1");
