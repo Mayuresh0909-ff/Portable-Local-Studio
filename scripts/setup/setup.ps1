@@ -274,6 +274,38 @@ $steps = 8
 Print-Step 1 $steps "Setting up portable Node.js (app/tools/node-win/)"
 
 $expectedNodeVersion = "v22.23.3"
+# SHA-256 of node-v22.23.3-win-x64.zip from the official Node.js SHASUMS256.txt for v22.23.3, as supplied by the maintainer.
+# Not re-fetched from nodejs.org in the build sandbox; see docs/setup-download-pins.md.
+$nodeZipSha256 = "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71"
+
+# Win32 MAX_PATH is 260 including the terminating NUL, so a path may be at most 259 characters.
+$nodeMaxPathLength = 259
+
+# Measures the longest path the Node.js archive would produce under TEMP (extraction) and under
+# the staging folder (copy into the project). Reads only the zip directory: nothing is extracted.
+function Get-NodeArchivePathLengths {
+    param([string]$ZipPath, [string]$ExtractRoot, [string]$StageRoot)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $topFolder  = "node-v22.23.3-win-x64/"
+    $extractMax = 0
+    $stageMax   = 0
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $extractLen = $ExtractRoot.Length + 1 + $entry.FullName.Length
+            if ($extractLen -gt $extractMax) { $extractMax = $extractLen }
+
+            $relative = $entry.FullName
+            if ($relative.StartsWith($topFolder)) { $relative = $relative.Substring($topFolder.Length) }
+            $stageLen = $StageRoot.Length + 1 + $relative.Length
+            if ($stageLen -gt $stageMax) { $stageMax = $stageLen }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return [pscustomobject]@{ ExtractMax = $extractMax; StageMax = $stageMax }
+}
 
 function Test-PortableNodeRuntime {
     param([string]$ExpectedVersion, [string]$Dir = $nodeDir)
@@ -336,10 +368,6 @@ if (-not $nodeReady) {
     $nodeZip = Join-Path $toolsDir "node.zip"
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
-    # No SHA-256 is pinned for this archive yet. The official SHASUMS256.txt at
-    # nodejs.org/dist/v22.23.3/ could not be retrieved when this was written, and the
-    # digest must not be guessed. Say so at download time instead of implying verification.
-    Print-Warn "Node.js v22.23.3 archive is NOT SHA-256 verified (official checksum not pinned yet)."
     $ok = Invoke-RichDownload `
         -Url  "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip" `
         -Dest $nodeZip `
@@ -347,10 +375,29 @@ if (-not $nodeReady) {
 
     if (-not $ok) { Print-Fail "Cannot download Node.js. The existing runtime (if any) was kept."; Read-Host; exit 1 }
 
+    # Verify the archive before anything is extracted or run. On mismatch, Assert-FileSha256
+    # deletes the archive and throws; the existing runtime is not touched.
+    try {
+        Assert-FileSha256 -Path $nodeZip -ExpectedSha256 $nodeZipSha256 -Label "Node.js v22.23.3 Windows x64 ZIP"
+    } catch {
+        Print-Fail $_.Exception.Message
+        Print-Fail "The existing Portable Node.js runtime was kept. Re-run setup to download the archive again."
+        Read-Host; exit 1
+    }
+
     # Extract under TEMP first: npm's deeply nested package paths can exceed the traditional
     # 260-character limit when extracted under a deep project path.
     $nodeExtractRoot = Join-Path $env:TEMP ("pls-node-extract-" + [Guid]::NewGuid().ToString("N"))
     try {
+        # Path-length guard: decide from the zip directory before extracting or copying anything.
+        $pathLengths = Get-NodeArchivePathLengths -ZipPath $nodeZip -ExtractRoot $nodeExtractRoot -StageRoot $nodeStagingDir
+        if ($pathLengths.StageMax -gt $nodeMaxPathLength) {
+            throw ("The Node.js runtime would need a {0}-character path inside app\tools (limit {1}), which Windows may refuse. Move the Portable-Local-Studio folder to a shorter location, for example C:\PLS, then run setup again. Nothing was copied into the project." -f $pathLengths.StageMax, $nodeMaxPathLength)
+        }
+        if ($pathLengths.ExtractMax -gt $nodeMaxPathLength) {
+            throw ("Extracting Node.js under your TEMP folder would need a {0}-character path (limit {1}). Create a short folder such as C:\Temp, then in the same command prompt run: set TEMP=C:\Temp and set TMP=C:\Temp, and start windows.bat again. Windows system settings were not changed." -f $pathLengths.ExtractMax, $nodeMaxPathLength)
+        }
+
         Expand-WithProgress -ZipPath $nodeZip -Destination $nodeExtractRoot -Label "Node.js"
 
         $extracted = Get-ChildItem $nodeExtractRoot -Directory |

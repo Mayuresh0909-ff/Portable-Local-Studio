@@ -86,10 +86,60 @@ test("whisper installer refuses unpinned releases and verifies before extraction
   assert.ok(verifyAt > 0 && extractAt > 0 && verifyAt < extractAt, "archive must be verified before Expand-Archive");
 });
 
-test("Node.js runtime is not claimed as checksum-verified until an official SHASUMS pin exists", () => {
+test("Node.js v22.23.3 Windows x64 ZIP is pinned to the supplied official SHA-256", () => {
   const source = read("scripts/setup/setup.ps1");
-  const nodeBlock = source.slice(source.indexOf("$nodeZip = Join-Path"), source.indexOf("Expand-WithProgress -ZipPath $nodeZip"));
-  assert.doesNotMatch(nodeBlock, /Assert-FileSha256/);
-  // Until an official digest is pinned, setup must say the archive is unverified.
-  assert.match(source, /Node\.js v22\.23\.3 archive is NOT SHA-256 verified/);
+  assert.match(source, /\$nodeZipSha256 = "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71"/);
+  // The old "not verified" warning must be gone once a digest is pinned.
+  assert.doesNotMatch(source, /NOT SHA-256 verified/);
+});
+
+test("Node.js archive is verified after download and before any extraction", () => {
+  const source = read("scripts/setup/setup.ps1");
+  const downloadAt = source.indexOf('-Label "Node.js v22.23.3 LTS (Portable ZIP)"');
+  const verifyAt = source.indexOf("Assert-FileSha256 -Path $nodeZip -ExpectedSha256 $nodeZipSha256");
+  const guardAt = source.indexOf("Get-NodeArchivePathLengths -ZipPath $nodeZip");
+  const extractAt = source.indexOf("Expand-WithProgress -ZipPath $nodeZip");
+  assert.ok(downloadAt > 0 && verifyAt > downloadAt, "verification must follow the download");
+  assert.ok(verifyAt < guardAt && guardAt < extractAt, "verification and path guard must precede extraction");
+});
+
+test("a Node.js checksum mismatch stops setup, keeps the runtime, and reports the cleanup", () => {
+  const source = read("scripts/setup/setup.ps1");
+  const verifyAt = source.indexOf("Assert-FileSha256 -Path $nodeZip");
+  const catchAt = source.indexOf("} catch {", verifyAt);
+  const block = source.slice(catchAt, source.indexOf("}", source.indexOf("Read-Host; exit 1", catchAt)) + 1);
+  assert.ok(catchAt > verifyAt, "a catch block must follow the Node.js verification");
+  assert.match(block, /Print-Fail \$_\.Exception\.Message/);
+  assert.match(block, /The existing Portable Node\.js runtime was kept/);
+  assert.match(block, /Read-Host; exit 1/);
+  // Nothing before verification may delete the active runtime.
+  const beforeVerify = source.slice(source.indexOf("if (-not $nodeReady) {"), verifyAt);
+  assert.doesNotMatch(beforeVerify, /Remove-Item -LiteralPath \$nodeDir /);
+});
+
+test("the helper deletes a mismatched archive before throwing", () => {
+  const source = read("scripts/setup/setup.ps1");
+  const helper = source.slice(source.indexOf("function Assert-FileSha256"));
+  const body = helper.slice(0, helper.indexOf("\n}\n"));
+  assert.match(body, /Remove-Item -LiteralPath \$Path -Force -ErrorAction SilentlyContinue\s*\n\s*throw "SHA-256 mismatch/);
+});
+
+test("the Node.js path-length guard runs before extraction and uses MAX_PATH minus NUL", () => {
+  const source = read("scripts/setup/setup.ps1");
+  assert.match(source, /\$nodeMaxPathLength = 259/);
+  assert.match(source, /function Get-NodeArchivePathLengths/);
+  // The guard reads only the zip directory: no extraction call may precede it in that function.
+  const fn = source.slice(source.indexOf("function Get-NodeArchivePathLengths"));
+  const body = fn.slice(0, fn.indexOf("\n}\n"));
+  assert.doesNotMatch(body, /Expand-|ExtractToFile|ExtractToDirectory/);
+  assert.match(source, /if \(\$pathLengths\.StageMax -gt \$nodeMaxPathLength\)/);
+  assert.match(source, /if \(\$pathLengths\.ExtractMax -gt \$nodeMaxPathLength\)/);
+});
+
+test("path-length messages give actionable steps without changing system settings", () => {
+  const source = read("scripts/setup/setup.ps1");
+  assert.match(source, /Move the Portable-Local-Studio folder to a shorter location, for example C:\\PLS/);
+  assert.match(source, /set TEMP=C:\\Temp and set TMP=C:\\Temp/);
+  assert.match(source, /Windows system settings were not changed/);
+  assert.doesNotMatch(source, /LongPathsEnabled|HKLM|reg add|Set-ItemProperty/);
 });
