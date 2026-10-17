@@ -38,6 +38,7 @@ const {
 } = require("./gpu-selection.cjs");
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
+const { inspectSafetensorsFile, warningsForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -7049,6 +7050,18 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   // GET /api/telemetry
   if (req.url === "/api/telemetry" && req.method === "GET") {
     return json(res, 200, getTelemetry());
+  }
+
+  // GET /api/models/inspect?file=<name>.safetensors — reads only the file header. Never loads a model.
+  if (req.url.split("?")[0] === "/api/models/inspect" && req.method === "GET") {
+    const requestedName = new URL(req.url, "http://localhost").searchParams.get("file");
+    const fullPath = safeSafetensorsPath(MODELS, requestedName);
+    if (!fullPath) {
+      return json(res, 400, { ok: false, error: "file must be the name of a .safetensors file in the models folder." });
+    }
+    if (!fs.existsSync(fullPath)) return json(res, 404, { ok: false, error: "Model file not found." });
+    const { path: _fullPath, ...report } = inspectSafetensorsFile(fullPath);
+    return json(res, 200, { ok: true, filename: path.basename(fullPath), ...report, warnings: warningsForReport(report) });
   }
 
   // GET /api/models — list available model files

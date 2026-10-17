@@ -12,7 +12,8 @@ import {
   getLlmStatus,
   listLlmModels,
   startLlm,
-  chatWithLlm
+  chatWithLlm,
+  inspectModelFile
 } from "../services/api";
 
 const GalleryItem = memo(({ img, idx, isSelected, onClick }) => {
@@ -68,6 +69,7 @@ function Generator({
   const [isRestartingBackend, setIsRestartingBackend] = useState(false);
   const [restartLoadProgress, setRestartLoadProgress] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [modelWarnings, setModelWarnings] = useState([]);
   const [isDecoding, setIsDecoding] = useState(false);
   const [selectedGalleryIndexes, setSelectedGalleryIndexes] = useState([]);
   const [baseImage, setBaseImage] = useState(null);
@@ -152,6 +154,20 @@ function Generator({
       setBaseImage(null);
     }
   }, [constraints.backendType]);
+
+  // Header check for the selected model. Shows warnings only; it never blocks generation.
+  React.useEffect(() => {
+    let cancelled = false;
+    const fileName = activeModel ? activeModel.split(/[\\/]/).pop() : "";
+    if (!/\.safetensors$/i.test(fileName)) {
+      setModelWarnings([]);
+      return undefined;
+    }
+    inspectModelFile(fileName).then((report) => {
+      if (!cancelled) setModelWarnings(report && Array.isArray(report.warnings) ? report.warnings : []);
+    });
+    return () => { cancelled = true; };
+  }, [activeModel]);
 
   const handleBaseImageSelect = (e) => {
     const file = e.target.files?.[0];
@@ -795,6 +811,14 @@ function Generator({
                   </div>
                 </div>
               </div>
+
+              {modelWarnings.length > 0 && (
+                <div role="status" style={{ marginTop: "8px", fontSize: "0.85rem", color: "var(--md-sys-color-error)" }}>
+                  {modelWarnings.map((warning) => (
+                    <div key={warning}>{warning}</div>
+                  ))}
+                </div>
+              )}
 
               {/* Generate Trigger Button */}
               <button

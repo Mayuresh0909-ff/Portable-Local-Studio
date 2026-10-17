@@ -317,6 +317,20 @@ export async function stopServer() {
   return "Backend stopped";
 }
 
+// Reads the header of a local .safetensors model and returns its warnings. Returns null when the
+// check cannot be made. Generation is never blocked by this check.
+export async function inspectModelFile(filename) {
+  if (!filename || !isLocalServerMode()) return null;
+  try {
+    const res = await fetch(`/api/models/inspect?file=${encodeURIComponent(filename)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data && data.ok ? data : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Get current backend status and active settings
 export async function getBackendStatus() {
   try {
