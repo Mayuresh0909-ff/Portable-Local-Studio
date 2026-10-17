@@ -27,7 +27,7 @@ Target laptop: AMD Radeon 610M (integrated, drives the display) and NVIDIA GeFor
 | Kokoro npm debug-log path regex (single-quoted) | IMPLEMENTED; TESTED — AUTOMATED | Commit `08ee3c2`; `scripts/tests/setup-tts-diagnostics.test.cjs`. Windows run: PENDING. |
 | Node runtime staging and rollback | IMPLEMENTED; TESTED — AUTOMATED (ordering checked in source) | Commit `f4bbc77`. Windows run: PENDING. |
 | User report: CUDA shown unavailable and an iGPU chosen on the hybrid laptop | USER-REPORTED | The exact message is not in the repository. |
-| Evidence capture script (`scripts/capture-gpu-evidence.cjs`) | PENDING (Stage B) | |
+| Evidence capture script (`scripts/capture-gpu-evidence.cjs`) | IMPLEMENTED; TESTED — AUTOMATED (Linux/macOS, fake backends) | `scripts/tests/gpu-evidence-capture.test.cjs`, `scripts/tests/gpu-probe-sequence.test.cjs`. Shares probe args, the 5 s timeout, the fallback sequence and the nvidia-smi query with the server (`gpu-selection.cjs`, `gpu-probe-runner.cjs`, `backend-paths.cjs`). The Windows run on the RTX 5060 is PENDING. |
 | NVIDIA `compute_cap` and `driver_version` in discovery | PENDING (Stage C) | |
 | Backend-options refresh guard (409 while a runtime is active) | PENDING (Stage D) | |
 | Safetensors header detector and UI warning | PENDING (Stage E) | |
@@ -44,5 +44,6 @@ Target laptop: AMD Radeon 610M (integrated, drives the display) and NVIDIA GeFor
 
 ## Manual steps
 
-See `WINDOWS_ACCEPTANCE.md` for the GPU procedure. The evidence-capture script and its steps will be
-added in Stage B.
+See `WINDOWS_ACCEPTANCE.md` for the GPU procedure. To capture evidence on the target laptop, run
+`node scripts/capture-gpu-evidence.cjs` from the repository root. It writes `gpu-evidence/gpu-evidence-<time>.json`,
+which is git-ignored. The RTX 5060 capture is PENDING until the user runs it on Windows.

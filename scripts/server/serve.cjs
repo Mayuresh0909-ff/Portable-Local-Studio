@@ -30,6 +30,13 @@ const {
   shouldRetryWithoutDeviceFlags,
   confirmUnpinnedDevice,
 } = require("./gpu-selection.cjs");
+const {
+  buildBackendProbeEnv,
+  buildBackendProbeSpawnOptions,
+  runBackendProbeSequence,
+} = require("./gpu-selection.cjs");
+const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
+const { createBackendPaths } = require("./backend-paths.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -62,16 +69,7 @@ const ROOT    = path.join(__dirname, "..", "..");
 const DIST    = path.join(ROOT, "app", "dist");
 const TOOLS   = path.join(ROOT, "app", "tools");
 const osPlatform = process.platform;
-const BACKEND_PATHS = {
-  cuda: path.join(ROOT, "app", "backend", "win", "cuda", "sd-cuda.exe"),
-  vulkan: path.join(ROOT, "app", "backend", "win", "vulkan", "sd-vulkan.exe"),
-  cpu: path.join(ROOT, "app", "backend", "win", "cpu", "sd-cpu.exe"),
-  mac: path.join(ROOT, "app", "backend", "mac", "sd"),
-  linuxCpu: path.join(ROOT, "app", "backend", "linux", "cpu", "sd-server-cpu"),
-  linuxVulkan: path.join(ROOT, "app", "backend", "linux", "vulkan", "sd-server-vulkan"),
-  linuxRocm: path.join(ROOT, "app", "backend", "linux", "rocm", "sd-server-rocm"),
-  linuxCuda: path.join(ROOT, "app", "backend", "linux", "cuda", "sd-server-cuda"),
-};
+const BACKEND_PATHS = createBackendPaths(ROOT);
 let BACKEND_PATH = "";
 const backendSupportsFlags = {};
 const backendValidationErrors = {};
@@ -790,48 +788,6 @@ function listLinuxDisplayGpus() {
 // nvidia-smi enumerates GPUs independently of which GPU drives the display, so it is the
 // primary evidence for NVIDIA compute devices. Missing tools and failed queries are reported
 // as errors, not as "no GPU".
-function queryNvidiaSmi() {
-  if (osPlatform === "darwin") {
-    return { ok: false, devices: [], error: "NVIDIA tools are not used on macOS." };
-  }
-  const commands = osPlatform === "win32"
-    ? ["nvidia-smi", "C:\\Windows\\System32\\nvidia-smi.exe", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe"]
-    : ["nvidia-smi", "/usr/bin/nvidia-smi"];
-  const queries = [
-    "index,name,memory.total,memory.free,display_active,pci.bus_id",
-    "index,name,memory.total,memory.free", // older drivers do not know display_active
-  ];
-  let lastError = "nvidia-smi was not found";
-  for (const command of commands) {
-    if (path.isAbsolute(command) && !fs.existsSync(command)) continue;
-    for (const fields of queries) {
-      const result = spawnSync(command, [`--query-gpu=${fields}`, "--format=csv,noheader,nounits"], {
-        encoding: "utf8",
-        windowsHide: true,
-        timeout: 5000,
-        maxBuffer: 1024 * 1024,
-      });
-      if (result.error) {
-        lastError = result.error.code === "ENOENT"
-          ? "nvidia-smi was not found"
-          : `nvidia-smi failed (${result.error.code || result.error.message})`;
-        break;
-      }
-      const output = `${result.stdout || ""}\n${result.stderr || ""}`;
-      if (result.status !== 0) {
-        lastError = findFirstErrorLine(output) || `nvidia-smi exited with code ${result.status}`;
-        if (/not a valid field|invalid field/i.test(output)) continue;
-        break;
-      }
-      const devices = parseNvidiaSmiCsv(result.stdout);
-      if (devices.length) return { ok: true, devices, error: null, command };
-      lastError = "nvidia-smi reported no NVIDIA GPUs";
-      break;
-    }
-  }
-  return { ok: false, devices: [], error: lastError };
-}
-
 function getGpuDiscovery(refresh = false) {
   if (cachedGpuDiscovery && !refresh) return cachedGpuDiscovery;
   let inventory = null;
@@ -839,7 +795,7 @@ function getGpuDiscovery(refresh = false) {
   else if (osPlatform === "linux") inventory = listLinuxDisplayGpus();
   cachedGpuDiscovery = {
     inventory,
-    nvidiaSmi: queryNvidiaSmi(),
+    nvidiaSmi: queryNvidiaSmi({ platform: osPlatform }),
     discoveredAt: Date.now(),
   };
   return cachedGpuDiscovery;
@@ -3552,14 +3508,7 @@ function getBackendOptions({ refresh = false } = {}) {
   return cachedBackendOptions;
 }
 
-function runBackendProbe(binaryPath, args, options) {
-  const result = spawnSync(binaryPath, args, options);
-  return {
-    output: `${result.stdout || ""}\n${result.stderr || ""}`,
-    exitCode: result.status,
-    errorCode: result.error ? (result.error.code || "ERROR") : null,
-  };
-}
+const runBackendProbe = runBackendProbeProcess;
 
 // Initializes a backend on one device. The model path is intentionally missing, so the backend
 // exits after creating its device context. "loading model" is printed only after that point.
@@ -3580,50 +3529,21 @@ function probeBackendDevice(binaryPath, backendName, cliBackendName = null) {
         : backendName === "rocm"
           ? "rocm0"
           : backendName);
-    let probeArgs = [
-      "--backend", cliName,
-      "--params-backend", cliName,
-      "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
-      "--listen-port", "18082",
-    ];
-    if (cliName === "metal") {
-      probeArgs = [
-        "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
-        "--listen-port", "18082",
-      ];
-    }
-    const spawnEnv = { ...process.env };
-    if (backendName === "cuda") Object.assign(spawnEnv, backendDeviceArgs("cuda", 0).env);
-    if (osPlatform === "linux") {
-      const dir = path.dirname(binaryPath);
-      const existing = spawnEnv.LD_LIBRARY_PATH || "";
-      spawnEnv.LD_LIBRARY_PATH = dir + (existing ? ":" + existing : "");
-    } else if (osPlatform === "darwin") {
-      const dir = path.dirname(binaryPath);
-      const existing = spawnEnv.DYLD_LIBRARY_PATH || "";
-      spawnEnv.DYLD_LIBRARY_PATH = dir + (existing ? ":" + existing : "");
-    }
-    const spawnOptions = { env: spawnEnv, encoding: "utf8", timeout: 5000 };
-
-    const first = runBackendProbe(binaryPath, probeArgs, spawnOptions);
-    let supportsFlags = true;
-    let verdict;
-    if (!first.errorCode && shouldRetryWithoutDeviceFlags(first.output)) {
-      // The binary does not accept --backend. Its device is then chosen by the backend, not pinned.
-      supportsFlags = false;
-      const fallbackArgs = [
-        "--model", path.join(MODELS, "__backend_probe_missing__.safetensors"),
-        "--listen-port", "18082",
-      ];
-      const fallback = runBackendProbe(binaryPath, fallbackArgs, spawnOptions);
-      verdict = classifyBackendProbe({
-        ...fallback, platform: osPlatform, cliName, stage: "fallback", supportsFlags,
-      });
-    } else {
-      verdict = classifyBackendProbe({
-        ...first, platform: osPlatform, cliName, stage: "primary", supportsFlags,
-      });
-    }
+    const missingModelPath = path.join(MODELS, "__backend_probe_missing__.safetensors");
+    const spawnEnv = buildBackendProbeEnv({
+      baseEnv: process.env,
+      backendName,
+      platform: osPlatform,
+      libraryDir: path.dirname(binaryPath),
+    });
+    const { verdict, supportsFlags } = runBackendProbeSequence({
+      run: runBackendProbe,
+      binaryPath,
+      cliName,
+      missingModelPath,
+      platform: osPlatform,
+      spawnOptions: buildBackendProbeSpawnOptions(spawnEnv),
+    });
 
     if (verdict.validationError) backendValidationErrors[binaryPath] = verdict.reason;
     if (verdict.accepted) backendSupportsFlags[binaryPath] = supportsFlags;

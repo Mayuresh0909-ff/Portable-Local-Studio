@@ -14,6 +14,9 @@
 
 const MAX_PROBED_VULKAN_DEVICES = 8;
 const MAX_PROBED_CUDA_DEVICES = 8;
+// Every backend probe is capped at this time. Shared by serve.cjs and scripts/capture-gpu-evidence.cjs.
+const PROBE_TIMEOUT_MS = 5000;
+const PROBE_LISTEN_PORT = "18082";
 
 // Names of GPUs that share system memory (APU/iGPU). Used only when the backend does not
 // report an integrated/UMA flag itself.
@@ -443,7 +446,7 @@ function classifyBackendProbe({
   const exitText = exitCode === null || exitCode === undefined ? "ended without an exit code" : `exited with code ${exitCode}`;
 
   if (errorCode === "ETIMEDOUT") {
-    return { ...base, accepted: false, probeError: "timeout", reason: `${subject} timed out after 5 seconds.` };
+    return { ...base, accepted: false, probeError: "timeout", reason: `${subject} timed out after ${PROBE_TIMEOUT_MS / 1000} seconds.` };
   }
   if (errorCode) {
     return { ...base, accepted: false, probeError: "start", reason: `${subject} could not be started (${errorCode}).` };
@@ -508,6 +511,68 @@ function classifyBackendProbe({
     accepted: false,
     reason: findFirstErrorLine(text) || `The backend ${exitText} before loading a model.`,
   };
+}
+
+// ── Backend probe launch ──────────────────────────────────────────────────────
+// Shared by serve.cjs (probeBackendDevice) and scripts/capture-gpu-evidence.cjs, so both launch a
+// backend the same way. The model path is missing on purpose: the backend creates its device
+// context and exits. Nothing is loaded and no image is generated.
+// Callers pass the missing-model path, the binary's folder, and a `run` function. This module
+// does not spawn processes itself.
+
+// Primary arguments. The device is pinned with --backend and --params-backend.
+// metal has no device flag here, so it receives only the model and port.
+function buildBackendProbeArgs({ cliName, missingModelPath }) {
+  if (cliName === "metal") {
+    return ["--model", missingModelPath, "--listen-port", PROBE_LISTEN_PORT];
+  }
+  return [
+    "--backend", cliName,
+    "--params-backend", cliName,
+    "--model", missingModelPath,
+    "--listen-port", PROBE_LISTEN_PORT,
+  ];
+}
+
+// Fallback arguments for a binary that rejects --backend. The backend then picks its own device.
+function buildBackendProbeFallbackArgs({ missingModelPath }) {
+  return ["--model", missingModelPath, "--listen-port", PROBE_LISTEN_PORT];
+}
+
+// Environment for a probe. CUDA is pinned to PCI bus order so its indices match nvidia-smi.
+// The binary's own folder is put first on the library search path, so bundled shared libraries
+// are found on Linux and macOS.
+function buildBackendProbeEnv({ baseEnv = {}, backendName, platform, libraryDir }) {
+  const env = { ...baseEnv };
+  if (backendName === "cuda") Object.assign(env, backendDeviceArgs("cuda", 0).env);
+  if (platform === "linux" && libraryDir) {
+    env.LD_LIBRARY_PATH = libraryDir + (env.LD_LIBRARY_PATH ? ":" + env.LD_LIBRARY_PATH : "");
+  } else if (platform === "darwin" && libraryDir) {
+    env.DYLD_LIBRARY_PATH = libraryDir + (env.DYLD_LIBRARY_PATH ? ":" + env.DYLD_LIBRARY_PATH : "");
+  }
+  return env;
+}
+
+function buildBackendProbeSpawnOptions(env) {
+  return { env, encoding: "utf8", timeout: PROBE_TIMEOUT_MS };
+}
+
+// Runs one device probe. If the binary rejects --backend, the probe is retried without device
+// flags. `run(binaryPath, args, options)` must return { output, exitCode, errorCode }.
+// Returns { verdict, supportsFlags }, where verdict is the classifyBackendProbe result.
+function runBackendProbeSequence({ run, binaryPath, cliName, missingModelPath, platform, spawnOptions }) {
+  const first = run(binaryPath, buildBackendProbeArgs({ cliName, missingModelPath }), spawnOptions);
+  if (!first.errorCode && shouldRetryWithoutDeviceFlags(first.output)) {
+    const fallback = run(binaryPath, buildBackendProbeFallbackArgs({ missingModelPath }), spawnOptions);
+    const verdict = classifyBackendProbe({
+      ...fallback, platform, cliName, stage: "fallback", supportsFlags: false,
+    });
+    return { verdict, supportsFlags: false };
+  }
+  const verdict = classifyBackendProbe({
+    ...first, platform, cliName, stage: "primary", supportsFlags: true,
+  });
+  return { verdict, supportsFlags: true };
 }
 
 // ── Selection ─────────────────────────────────────────────────────────────────
@@ -840,6 +905,13 @@ module.exports = {
   shouldRetryWithoutDeviceFlags,
   confirmUnpinnedDevice,
   classifyBackendProbe,
+  PROBE_TIMEOUT_MS,
+  PROBE_LISTEN_PORT,
+  buildBackendProbeArgs,
+  buildBackendProbeFallbackArgs,
+  buildBackendProbeEnv,
+  buildBackendProbeSpawnOptions,
+  runBackendProbeSequence,
   INTEGRATED_GPU_NAME_PATTERNS,
   classifyGpuName,
   isVirtualOrSoftwareGpu,

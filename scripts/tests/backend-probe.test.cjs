@@ -452,18 +452,24 @@ test("findDeviceFailureLine returns the matching line verbatim, and the missing-
 
 // ── 6. serve.cjs uses the classifier and no longer applies the old acceptance rule ──────────────
 
-test("serve.cjs classifies probes with classifyBackendProbe and no longer accepts on 'loading model' alone", () => {
+// The probe sequence moved from serve.cjs into gpu-selection.cjs (runBackendProbeSequence), so the
+// same assertions now read that file. serve.cjs must delegate to it. Behaviour is also covered by
+// gpu-probe-sequence.test.cjs.
+test("probe classification lives in gpu-selection.cjs and serve.cjs delegates to it", () => {
   const server = read("scripts/server/serve.cjs");
-  assert.match(server, /classifyBackendProbe\(\{/);
-  assert.match(server, /shouldRetryWithoutDeviceFlags\(first\.output\)/);
+  const selection = read("scripts/server/gpu-selection.cjs");
+  assert.match(server, /runBackendProbeSequence\(\{/);
+  assert.match(selection, /classifyBackendProbe\(\{/);
+  assert.match(selection, /shouldRetryWithoutDeviceFlags\(first\.output\)/);
   assert.doesNotMatch(server, /const isOk = lower\.includes\("loading model"\)/);
+  assert.doesNotMatch(selection, /const isOk = lower\.includes\("loading model"\)/);
   assert.doesNotMatch(server, /const deviceFailure = \/failed to \(create\|init\|initialize\)\/i/);
 });
 
-test("serve.cjs reports a fallback-stage result separately from a primary-stage result", () => {
-  const server = read("scripts/server/serve.cjs");
-  assert.match(server, /stage: "fallback", supportsFlags/);
-  assert.match(server, /stage: "primary", supportsFlags/);
+test("the probe sequence reports a fallback-stage result separately from a primary-stage result", () => {
+  const selection = read("scripts/server/gpu-selection.cjs");
+  assert.match(selection, /stage: "fallback", supportsFlags/);
+  assert.match(selection, /stage: "primary", supportsFlags/);
 });
 
 test("serve.cjs never labels an unpinned device with the preferred candidate's name", () => {
