@@ -645,7 +645,9 @@ test("the GPU selection module has no process, filesystem, or network access", (
 test("host hardware refresh has its own cache path and refuses to run while model runtimes are active", () => {
   const server = read("scripts/server/serve.cjs");
   assert.match(server, /function refreshHardwareDiscoveryState\(\)/);
-  assert.match(server, /if \(backendProc !== null \|\| llmProc !== null\)/);
+  // The guard moved into assertDiscoveryRefreshAllowed(), which reads the same runtime flags.
+  assert.match(server, /function refreshHardwareDiscoveryState\(\) \{[\s\S]*?assertDiscoveryRefreshAllowed\(\);/);
+  assert.match(server, /function currentDiscoveryRefreshBlock\(\)[\s\S]*?backendProc !== null[\s\S]*?llmProc !== null/);
   assert.match(server, /req\.url\.split\("\?"\)\[0\] === "\/api\/hardware-specs"/);
   assert.match(server, /refreshHardwareDiscoveryState\(\);/);
 

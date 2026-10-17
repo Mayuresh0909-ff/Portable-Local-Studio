@@ -34,6 +34,7 @@ const {
   buildBackendProbeEnv,
   buildBackendProbeSpawnOptions,
   runBackendProbeSequence,
+  discoveryRefreshBlockedReason,
 } = require("./gpu-selection.cjs");
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
@@ -1442,11 +1443,9 @@ if (osPlatform === "darwin") {
 // Explicit refresh for the host-hardware view. These caches describe hardware inventory and
 // telemetry; they are deliberately separate from the device used by the last image generation.
 function refreshHardwareDiscoveryState() {
-  // Avoid probing drivers or clearing the selected-device record while either model runtime is
-  // running. The UI disables this action in that state; the server also enforces it for API callers.
-  if (backendProc !== null || llmProc !== null) {
-    throw new Error("Stop the active image or text model before refreshing hardware detection.");
-  }
+  // Avoid probing drivers or clearing the selected-device record while a model runtime is running.
+  // The UI disables this action in that state; the server also enforces it for API callers.
+  assertDiscoveryRefreshAllowed();
 
   cachedGpuInfo = null;
   cachedGpuDiscovery = null;
@@ -3339,8 +3338,27 @@ function getSelectedBackendDeviceSummary(kind) {
 //   3. gpu-selection.cjs picks the device to use, honoring valid SD_CUDA_DEVICE/SD_VULKAN_DEVICE.
 // Results are cached. The cache is cleared when backends or models change, and a CPU-only result
 // is re-checked after GPU_NEGATIVE_CACHE_TTL_MS or when called with refresh.
+// Throws when a discovery refresh must not run now. Used by both refresh routes and by the
+// automatic re-check in getBackendOptions, so no path can re-probe while a runtime is active.
+function currentDiscoveryRefreshBlock() {
+  return discoveryRefreshBlockedReason({
+    imageRunning: backendProc !== null,
+    textRunning: llmProc !== null,
+    openvinoRunning: openvinoProc !== null,
+    generating: generationState.active,
+  });
+}
+
+function assertDiscoveryRefreshAllowed() {
+  const reason = currentDiscoveryRefreshBlock();
+  if (reason) throw new Error(reason);
+}
+
 function getBackendOptions({ refresh = false } = {}) {
-  const negativeExpired = cachedBackendOptionsNegative && Date.now() - cachedBackendOptionsAt > GPU_NEGATIVE_CACHE_TTL_MS;
+  // The automatic re-check after the negative-cache TTL must not probe while a runtime is active.
+  // The cached answer is returned until the runtime stops.
+  const runtimeActive = currentDiscoveryRefreshBlock() !== null;
+  const negativeExpired = !runtimeActive && cachedBackendOptionsNegative && Date.now() - cachedBackendOptionsAt > GPU_NEGATIVE_CACHE_TTL_MS;
   if (cachedBackendOptions && !refresh && !negativeExpired) return cachedBackendOptions;
 
   const discovery = getGpuDiscovery(refresh || negativeExpired);
@@ -7018,6 +7036,13 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   // GET /api/backend-options
   if (req.url.split("?")[0] === "/api/backend-options" && req.method === "GET") {
     const refresh = /[?&]refresh=1(?:&|$)/.test(req.url);
+    if (refresh) {
+      try {
+        assertDiscoveryRefreshAllowed();
+      } catch (err) {
+        return json(res, 409, { ok: false, error: err.message || String(err) });
+      }
+    }
     return json(res, 200, getBackendOptions({ refresh }));
   }
 

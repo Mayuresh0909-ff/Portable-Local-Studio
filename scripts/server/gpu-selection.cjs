@@ -585,6 +585,16 @@ function runBackendProbeSequence({ run, binaryPath, cliName, missingModelPath, p
   return { verdict, supportsFlags: true };
 }
 
+// ── Refresh guard ─────────────────────────────────────────────────────────────
+// A refresh re-runs nvidia-smi and the backend probes, and it clears the cached device records. The
+// running runtime's selected-device record must not change under it, so refresh is refused while
+// any model runtime is active. Returns the message to show, or null when a refresh may run.
+const DISCOVERY_REFRESH_BLOCKED_MESSAGE = "Stop the active image or text model before refreshing hardware detection.";
+
+function discoveryRefreshBlockedReason({ imageRunning = false, textRunning = false, openvinoRunning = false, generating = false } = {}) {
+  return imageRunning || textRunning || openvinoRunning || generating ? DISCOVERY_REFRESH_BLOCKED_MESSAGE : null;
+}
+
 // ── Selection ─────────────────────────────────────────────────────────────────
 
 // A probe that throws is a failed probe, not a crash of the whole selection.
@@ -941,4 +951,6 @@ module.exports = {
   describeGpuFallback,
   selectCudaBackend,
   selectVulkanBackend,
+  DISCOVERY_REFRESH_BLOCKED_MESSAGE,
+  discoveryRefreshBlockedReason,
 };
