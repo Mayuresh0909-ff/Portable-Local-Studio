@@ -90,4 +90,6 @@ test("Node.js runtime is not claimed as checksum-verified until an official SHAS
   const source = read("scripts/setup/setup.ps1");
   const nodeBlock = source.slice(source.indexOf("$nodeZip = Join-Path"), source.indexOf("Expand-WithProgress -ZipPath $nodeZip"));
   assert.doesNotMatch(nodeBlock, /Assert-FileSha256/);
+  // Until an official digest is pinned, setup must say the archive is unverified.
+  assert.match(source, /Node\.js v22\.23\.3 archive is NOT SHA-256 verified/);
 });

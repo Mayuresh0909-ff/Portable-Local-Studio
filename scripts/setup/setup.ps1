@@ -321,6 +321,10 @@ if (-not $nodeReady) {
     $nodeZip = Join-Path $toolsDir "node.zip"
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
+    # No SHA-256 is pinned for this archive yet. The official SHASUMS256.txt at
+    # nodejs.org/dist/v22.23.3/ could not be retrieved when this was written, and the
+    # digest must not be guessed. Say so at download time instead of implying verification.
+    Print-Warn "Node.js v22.23.3 archive is NOT SHA-256 verified (official checksum not pinned yet)."
     $ok = Invoke-RichDownload `
         -Url  "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip" `
         -Dest $nodeZip `
