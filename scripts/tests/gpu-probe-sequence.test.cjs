@@ -200,14 +200,15 @@ test("a driver that rejects compute_cap falls back to the query without it, and 
   const spawn = (command, args) => {
     calls.push(args[0]);
     if (calls.length === 1) return { status: 2, stdout: "", stderr: 'Field "compute_cap" is not a valid field to query.' };
-    return { status: 0, stdout: "0, NVIDIA GeForce RTX 3060, 12288, 11000, Enabled, 00000000:01:00.0\n", stderr: "" };
+    return { status: 0, stdout: "0, NVIDIA GeForce RTX 3060, 12288, 11000, Enabled, 00000000:01:00.0, 566.36\n", stderr: "" };
   };
   const result = runner.queryNvidiaSmi({ platform: "linux", spawn, exists: () => true });
   assert.equal(calls.length, 2);
-  assert.equal(calls[1], "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id");
+  // The second query keeps driver_version and drops only compute_cap.
+  assert.equal(calls[1], "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version");
   assert.equal(result.ok, true);
   assert.equal(result.devices[0].computeCap, null);
-  assert.equal(result.devices[0].driverVersion, null);
+  assert.equal(result.devices[0].driverVersion, "566.36");
   assert.equal(result.devices[0].displayActive, true);
 });
 
@@ -246,4 +247,56 @@ test("the real nvidia-smi query returns a well-formed result on this machine", (
   assert.equal(typeof result.ok, "boolean");
   assert.ok(Array.isArray(result.devices));
   if (!result.ok) assert.equal(typeof result.error, "string");
+});
+
+test("the query chain keeps driver_version when compute_cap is rejected, and reaches the oldest query in order", () => {
+  // A driver that knows driver_version but not compute_cap must keep the driver version.
+  // A driver that knows neither extra field must still reach the 4-field query.
+  const calls = [];
+  const rejects = (field) => (args) => args[0].includes(field);
+  const spawn = (command, args) => {
+    calls.push(args[0]);
+    if (rejects("compute_cap")(args) || rejects("driver_version")(args) || rejects("display_active")(args)) {
+      const field = ["compute_cap", "driver_version", "display_active"].find((f) => args[0].includes(f));
+      return { status: 2, stdout: "", stderr: `Field "${field}" is not a valid field to query.` };
+    }
+    return { status: 0, stdout: "0, NVIDIA GeForce RTX 3060, 12288, 11000\n", stderr: "" };
+  };
+  const result = runner.queryNvidiaSmi({ platform: "linux", spawn, exists: () => true });
+  assert.deepEqual(calls, [
+    "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version,compute_cap",
+    "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version",
+    "--query-gpu=index,name,memory.total,memory.free,display_active,pci.bus_id",
+    "--query-gpu=index,name,memory.total,memory.free",
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.devices[0].driverVersion, null);
+  assert.equal(result.devices[0].computeCap, null);
+  assert.equal(result.devices[0].busId, null);
+});
+
+test("a compute capability alone does not make a CUDA backend available", () => {
+  // computeCap is information only. A device with compute capability 12.0 is not usable unless
+  // the backend probe accepts it.
+  const nvidiaSmi = {
+    ok: true,
+    devices: [{ index: 0, name: "NVIDIA GeForce RTX 5060 Laptop GPU", vramGb: 8, freeVramGb: 7, displayActive: false, busId: "00000000:01:00.0", driverVersion: "580.00", computeCap: "12.0", source: "nvidia-smi" }],
+  };
+  const rejected = selection.selectCudaBackend({
+    installed: true,
+    nvidiaSmi,
+    inventory: null,
+    preference: null,
+    probe: () => ({ accepted: false, reason: "CUDA error: device not supported by this build" }),
+  });
+  assert.equal(rejected.available, false, "a compute capability with a rejecting probe must not be available");
+
+  const accepted = selection.selectCudaBackend({
+    installed: true,
+    nvidiaSmi,
+    inventory: null,
+    preference: null,
+    probe: () => ({ accepted: true, initConfirmed: true }),
+  });
+  assert.equal(accepted.available, true, "an accepting probe makes the backend available, whatever the capability");
 });
