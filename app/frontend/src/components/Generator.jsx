@@ -70,6 +70,7 @@ function Generator({
   const [restartLoadProgress, setRestartLoadProgress] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const [modelWarnings, setModelWarnings] = useState([]);
+  const [modelCompatibility, setModelCompatibility] = useState([]);
   const [isDecoding, setIsDecoding] = useState(false);
   const [selectedGalleryIndexes, setSelectedGalleryIndexes] = useState([]);
   const [baseImage, setBaseImage] = useState(null);
@@ -161,10 +162,13 @@ function Generator({
     const fileName = activeModel ? activeModel.split(/[\\/]/).pop() : "";
     if (!/\.safetensors$/i.test(fileName)) {
       setModelWarnings([]);
+      setModelCompatibility([]);
       return undefined;
     }
     inspectModelFile(fileName).then((report) => {
-      if (!cancelled) setModelWarnings(report && Array.isArray(report.warnings) ? report.warnings : []);
+      if (cancelled) return;
+      setModelWarnings(report && Array.isArray(report.warnings) ? report.warnings : []);
+      setModelCompatibility(report && Array.isArray(report.compatibility) ? report.compatibility : []);
     });
     return () => { cancelled = true; };
   }, [activeModel]);
@@ -816,6 +820,20 @@ function Generator({
                 <div role="status" style={{ marginTop: "8px", fontSize: "0.85rem", color: "var(--md-sys-color-error)" }}>
                   {modelWarnings.map((warning) => (
                     <div key={warning}>{warning}</div>
+                  ))}
+                </div>
+              )}
+
+              {modelCompatibility.length > 0 && (
+                <div role="note" style={{ marginTop: "6px", fontSize: "0.85rem" }}>
+                  <div style={{ fontWeight: 600 }}>Compatibility check (does not block Generate)</div>
+                  {modelCompatibility.map((item) => (
+                    <div key={item.setting} style={{ marginTop: "4px" }}>
+                      <div>{item.message}</div>
+                      <div style={{ opacity: 0.8, fontSize: "0.8rem" }}>
+                        Setting: {item.setting}. Evidence: {(item.evidence || []).join("; ")}.
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}

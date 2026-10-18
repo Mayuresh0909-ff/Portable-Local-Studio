@@ -230,3 +230,131 @@ test("the generator checks the selected model's header and shows warnings withou
   assert.match(button, /disabled=\{isGenerating \|\| !prompt\.trim\(\) \|\| !activeModel\}/);
   assert.doesNotMatch(button.slice(0, 400), /modelWarnings/);
 });
+
+// ── Evidence, confidence, and compatibility (Task 3) ─────────────────────────────
+
+test("high confidence: an SDXL file names the marker it used, and gets no compatibility warning", () => {
+  const file = writeSafetensors("sdxl-complete.safetensors", {
+    "conditioner.embedders.0.transformer.text_model.x": 32,
+    "conditioner.embedders.1.model.text_projection": 32,
+    "model.diffusion_model.input_blocks.0.0.weight": 32,
+    "first_stage_model.decoder.conv_in.weight": 32,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "sdxl");
+  assert.equal(report.confidence, "high");
+  assert.ok(report.evidence.some((line) => /conditioner\.embedders\.1\./.test(line)), "the evidence names the SDXL marker");
+  assert.ok(report.evidence.some((line) => /^\d+ tensors, dtypes F16/.test(line)), "the evidence gives the tensor count and dtypes");
+  assert.deepEqual(st.compatibilityForReport(report), []);
+});
+
+test("high confidence: an SD 1.x file needs both its text model and its UNet blocks", () => {
+  const report = st.inspectSafetensorsFile(writeSafetensors("sd15-high.safetensors", SD15_KEYS));
+  assert.equal(report.family, "sd1-sd2");
+  assert.equal(report.confidence, "high");
+  assert.ok(report.evidence.some((line) => /cond_stage_model\.transformer\.text_model\./.test(line)));
+});
+
+test("low confidence: UNet block names alone make no family claim, so the label is not 'likely'", () => {
+  const file = writeSafetensors("unet-only.safetensors", {
+    "model.diffusion_model.input_blocks.0.0.weight": 64,
+    "model.diffusion_model.middle_block.0.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "diffusion-unknown");
+  assert.equal(report.confidence, "low");
+  assert.equal(report.familyLabel, st.FAMILY_LABELS["diffusion-unknown"]);
+  assert.doesNotMatch(report.familyLabel, /likely/, "no family is claimed");
+  assert.deepEqual(st.compatibilityForReport(report), []);
+});
+
+test("low confidence: an SD3-style joint block is named 'likely' with low confidence, and gets no warning", () => {
+  const file = writeSafetensors("sd3-like.safetensors", {
+    "joint_blocks.0.x.weight": 64,
+    "model.diffusion_model.joint_blocks.1.y.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "sd3");
+  assert.equal(report.confidence, "low");
+  assert.match(report.familyLabel, /likely/);
+  assert.deepEqual(st.compatibilityForReport(report), [], "no reliable evidence links SD3 to a launch restriction");
+});
+
+test("unknown family: no recognised names gives family unknown, confidence none, and no warnings of any kind", () => {
+  const file = writeSafetensors("unknown.safetensors", { "custom.weight": 64, "custom.bias": 64 });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "unknown");
+  assert.equal(report.confidence, "none");
+  assert.ok(report.evidence.includes("no diffusion weight names found"));
+  assert.deepEqual(st.warningsForReport(report), []);
+  assert.deepEqual(st.compatibilityForReport(report), []);
+});
+
+test("unsupported setting: a Flux-style file with no text encoder or VAE gets one non-blocking compatibility warning for the launch mode", () => {
+  const file = writeSafetensors("flux-compat.safetensors", {
+    "double_blocks.0.img_attn.qkv.weight": 64,
+    "single_blocks.0.linear1.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.status, "ok", "the file itself is readable, so nothing blocks");
+  assert.equal(report.confidence, "high");
+  const compatibility = st.compatibilityForReport(report);
+  assert.equal(compatibility.length, 1);
+  assert.equal(compatibility[0].setting, st.LAUNCH_SETTING);
+  assert.equal(compatibility[0].severity, "warning");
+  assert.match(compatibility[0].message, /--model/);
+  assert.match(compatibility[0].message, /does not block Generate/);
+  assert.match(compatibility[0].message, /text encoder and VAE/);
+  assert.ok(compatibility[0].evidence.some((line) => /double_blocks/.test(line)), "the warning carries its evidence");
+  assert.match(st.warningsForReport(report).join("\n"), /may need matching files/, "the existing general warning is kept");
+});
+
+test("no warning: a Flux-style file that includes its text encoder and VAE is compatible with the launch", () => {
+  const file = writeSafetensors("flux-all-in-one.safetensors", {
+    "double_blocks.0.img_attn.qkv.weight": 64,
+    "single_blocks.0.linear1.weight": 64,
+    "text_encoders.t5xxl.encoder.weight": 64,
+    "vae.decoder.conv_in.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "flux");
+  assert.equal(report.components.textEncoder, true);
+  assert.equal(report.components.vae, true);
+  assert.deepEqual(st.compatibilityForReport(report), []);
+  assert.deepEqual(st.warningsForReport(report), []);
+});
+
+test("no warning: a complete SD 1.x file and a language model get no compatibility warning", () => {
+  assert.deepEqual(st.compatibilityForReport(st.inspectSafetensorsFile(writeSafetensors("sd15-compat.safetensors", SD15_KEYS))), []);
+  const llm = st.inspectSafetensorsFile(writeSafetensors("llm-compat.safetensors", {
+    "model.embed_tokens.weight": 64,
+    "model.layers.0.self_attn.q_proj.weight": 64,
+  }));
+  assert.deepEqual(st.compatibilityForReport(llm), []);
+});
+
+test("no compatibility warning for a file that is invalid or incomplete, and the evidence says why", () => {
+  const incomplete = st.inspectSafetensorsFile(writeSafetensors("flux-short.safetensors", {
+    "double_blocks.0.img_attn.qkv.weight": 64,
+  }, { dataBytes: 10 }));
+  assert.equal(incomplete.status, "incomplete");
+  assert.deepEqual(st.compatibilityForReport(incomplete), []);
+  assert.ok(incomplete.evidence.length >= 1);
+
+  const invalid = st.inspectSafetensorsFile(path.join(dir, "does-not-exist.safetensors"));
+  assert.equal(invalid.status, "invalid");
+  assert.deepEqual(invalid.evidence, [invalid.reason], "an invalid file's evidence is the reason it was rejected");
+  assert.deepEqual(st.compatibilityForReport(invalid), []);
+});
+
+const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), "utf8");
+
+test("source: the inspect route returns compatibility, and the generator shows it without disabling Generate", () => {
+  const serve = read("scripts/server/serve.cjs");
+  assert.match(serve, /compatibility: compatibilityForReport\(report\)/);
+  const generator = read("app/frontend/src/components/Generator.jsx");
+  assert.match(generator, /setModelCompatibility\(report && Array\.isArray\(report\.compatibility\)/);
+  assert.match(generator, /role="note"[\s\S]*?Compatibility check \(does not block Generate\)/);
+  // Generate stays enabled. Only prompt and model state disable it, as before.
+  assert.match(generator, /disabled=\{isGenerating \|\| !prompt\.trim\(\) \|\| !activeModel\}/);
+});

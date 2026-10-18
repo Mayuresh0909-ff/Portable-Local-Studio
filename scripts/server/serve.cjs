@@ -38,7 +38,7 @@ const {
 } = require("./gpu-selection.cjs");
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
-const { inspectSafetensorsFile, warningsForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
+const { inspectSafetensorsFile, warningsForReport, compatibilityForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
 const { classifyBackendFailure } = require("./failure-classification.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
@@ -7080,7 +7080,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     }
     if (!fs.existsSync(fullPath)) return json(res, 404, { ok: false, error: "Model file not found." });
     const { path: _fullPath, ...report } = inspectSafetensorsFile(fullPath);
-    return json(res, 200, { ok: true, filename: path.basename(fullPath), ...report, warnings: warningsForReport(report) });
+    return json(res, 200, { ok: true, filename: path.basename(fullPath), ...report, warnings: warningsForReport(report), compatibility: compatibilityForReport(report) });
   }
 
   // GET /api/models — list available model files

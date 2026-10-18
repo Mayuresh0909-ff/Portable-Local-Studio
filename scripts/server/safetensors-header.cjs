@@ -7,6 +7,13 @@
 // This module never reads tensor data, and it never loads a model. The family label is a guess
 // from tensor-name prefixes. It is labelled "likely" and is not a compatibility guarantee: whether
 // the image backend can load a file is decided only by the backend itself.
+//
+// Each report carries:
+//   - evidence: the tensor-name facts the guess used, as short sentences;
+//   - confidence: "high" (a family-specific marker, with the components that family needs),
+//     "low" (a marker shared with other families, or only part of the evidence), or "none".
+// A compatibility warning is given only where the header itself supports it, for one setting that
+// the app really uses (the launch mode). Warnings never block Generate.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -26,7 +33,17 @@ const FAMILY_LABELS = {
   unknown: "Family not recognised",
 };
 
-// Looks at tensor names only. Returns the family id and which components are present.
+// Tensor-name markers. `shared` markers are also used by other families, so they alone are weak.
+const MARKERS = [
+  { id: "sdxlSecondEncoder", pattern: /^conditioner\.embedders\.1\./, prefix: "conditioner.embedders.1.", meaning: "SDXL second text encoder" },
+  { id: "sd3Joint", pattern: /^joint_blocks\./, prefix: "joint_blocks.", meaning: "SD3-style joint transformer blocks" },
+  { id: "fluxBlocks", pattern: /^(double|single)_blocks\./, prefix: "double_blocks. / single_blocks.", meaning: "Flux-style transformer blocks" },
+  { id: "sd1TextModel", pattern: /^cond_stage_model\.transformer\.text_model\./, prefix: "cond_stage_model.transformer.text_model.", meaning: "SD 1.x / 2.x CLIP text encoder" },
+  { id: "unetInputBlocks", pattern: /^model\.diffusion_model\.input_blocks\./, prefix: "model.diffusion_model.input_blocks.", meaning: "UNet input blocks, shared by SD 1.x, 2.x and SDXL" },
+];
+
+// Looks at tensor names only. Returns the family id, which components are present, the confidence,
+// and the evidence used.
 function detectSafetensorsFamily(names) {
   const list = Array.isArray(names) ? names : [];
   const has = (pattern) => list.some((name) => pattern.test(name));
@@ -36,14 +53,40 @@ function detectSafetensorsFamily(names) {
     vae: has(/^first_stage_model\.|^vae\.|^decoder\.up_blocks\.|^encoder\.down_blocks\./),
     languageModel: has(/^model\.layers\.\d+\./) && has(/embed_tokens/),
   };
+  const found = Object.fromEntries(MARKERS.map((marker) => [marker.id, has(marker.pattern)]));
+
+  const evidence = [];
+  for (const marker of MARKERS) {
+    if (found[marker.id]) evidence.push(`tensor names start with "${marker.prefix}" (${marker.meaning})`);
+  }
+  if (components.languageModel) evidence.push("model.layers.N and embed_tokens names found");
+  evidence.push(components.diffusion ? "diffusion weight names found" : "no diffusion weight names found");
+  evidence.push(components.textEncoder ? "text encoder names found" : "no text encoder names found");
+  evidence.push(components.vae ? "VAE names found" : "no VAE names found");
+
   let family = "unknown";
-  if (components.languageModel && !components.diffusion) family = "language-model";
-  else if (has(/^conditioner\.embedders\.1\./)) family = "sdxl";
-  else if (has(/^joint_blocks\./)) family = "sd3";
-  else if (has(/^(double|single)_blocks\./)) family = "flux";
-  else if (has(/^cond_stage_model\.transformer\.text_model\./) || has(/^model\.diffusion_model\.input_blocks\./)) family = "sd1-sd2";
-  else if (components.diffusion) family = "diffusion-unknown";
-  return { family, label: FAMILY_LABELS[family], components };
+  let confidence = "none";
+  if (components.languageModel && !components.diffusion) {
+    family = "language-model";
+    confidence = "high";
+  } else if (found.sdxlSecondEncoder && components.diffusion) {
+    family = "sdxl";
+    confidence = "high";
+  } else if (found.sd3Joint) {
+    family = "sd3";
+    confidence = "low"; // joint blocks are not unique to one family, so this stays a likely guess
+  } else if (found.fluxBlocks) {
+    family = "flux";
+    confidence = "high";
+  } else if (found.sd1TextModel && found.unetInputBlocks) {
+    family = "sd1-sd2";
+    confidence = "high";
+  } else if (components.diffusion) {
+    // Input-block names alone also appear in SDXL refiners and other models, so no family is claimed.
+    family = "diffusion-unknown";
+    confidence = found.unetInputBlocks || found.sd1TextModel ? "low" : "none";
+  }
+  return { family, label: FAMILY_LABELS[family], components, confidence, evidence };
 }
 
 // Checks a parsed header object. Returns { ok: true, tensorNames, dtypes, maxDataEnd } or
@@ -75,7 +118,13 @@ function checkHeaderObject(header) {
 
 // Reads the header of a file. Never reads past the header. Returns a plain report object.
 function inspectSafetensorsFile(filePath) {
-  const base = { path: filePath, status: "invalid", reason: null, fileBytes: 0, expectedBytes: null, missingBytes: null, tensorCount: 0, dtypes: [], family: null, components: null };
+  const report = readSafetensorsHeader(filePath);
+  if (!report.evidence) report.evidence = report.reason ? [report.reason] : [];
+  return report;
+}
+
+function readSafetensorsHeader(filePath) {
+  const base = { path: filePath, status: "invalid", reason: null, fileBytes: 0, expectedBytes: null, missingBytes: null, tensorCount: 0, dtypes: [], family: null, components: null, confidence: "none", evidence: null };
   let fd;
   try {
     const stats = fs.statSync(filePath);
@@ -121,6 +170,8 @@ function inspectSafetensorsFile(filePath) {
       family: family.family,
       familyLabel: family.label,
       components: family.components,
+      confidence: family.confidence,
+      evidence: [`${check.tensorNames.length} tensors, dtypes ${check.dtypes.join(", ") || "none"}`, ...family.evidence],
       expectedBytes,
     };
     if (stats.size < expectedBytes) {
@@ -170,7 +221,35 @@ function safeSafetensorsPath(modelsDir, requestedName) {
   return path.join(modelsDir, name);
 }
 
+// Compatibility warnings against the app's own settings. Only conditions the header supports are
+// reported. Each one is non-blocking and names the setting it is about.
+//
+// The only setting checked is the launch mode. The app launches every .safetensors file with
+// --model and passes no separate text-encoder or VAE files (see serve.cjs, the launch arguments).
+// A Flux-style diffusion file with no text encoder or no VAE therefore lacks files the app will not
+// supply. Nothing else is checked, because no reliable evidence links a family to a sampler,
+// resolution, or config restriction.
+const LAUNCH_SETTING = "launch: --model (single-file)";
+
+function compatibilityForReport(report) {
+  if (!report || report.status !== "ok") return [];
+  const components = report.components || {};
+  const compatibility = [];
+  if (report.family === "flux" && report.confidence === "high" && components.diffusion && (!components.textEncoder || !components.vae)) {
+    const missing = [!components.textEncoder ? "text encoder" : null, !components.vae ? "VAE" : null].filter(Boolean).join(" and ");
+    compatibility.push({
+      setting: LAUNCH_SETTING,
+      severity: "warning",
+      message: `This is a Flux-style diffusion file with no ${missing} tensors. The app launches .safetensors files with --model and does not supply separate text-encoder or VAE files, so this file may not generate images on its own. This warning does not block Generate.`,
+      evidence: report.evidence || [],
+    });
+  }
+  return compatibility;
+}
+
 module.exports = {
+  LAUNCH_SETTING,
+  compatibilityForReport,
   MAX_HEADER_BYTES,
   FAMILY_LABELS,
   detectSafetensorsFamily,
