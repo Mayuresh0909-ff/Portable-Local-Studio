@@ -117,7 +117,22 @@ function classifyBackendFailure({ output = "", exitCode = null, platform = "linu
   return null;
 }
 
+// Header that carries the category of a failed image-generation response to the browser.
+const ERROR_CATEGORY_HEADER = "X-Studio-Error-Category";
+const CLASSIFY_CHARS = 8000;
+
+// Category for an error response from the image backend. It uses only the response body and the
+// captured backend error text. With no reliable evidence the answer is "unknown". A generic error is
+// never reported as a model-compatibility problem.
+function generationErrorCategory({ body = "", backendError = "", platform = process.platform } = {}) {
+  const text = `${String(body || "").slice(0, CLASSIFY_CHARS)}\n${String(backendError || "").slice(-CLASSIFY_CHARS)}`;
+  const found = classifyBackendFailure({ output: text, platform });
+  return found ? found.category : "unknown";
+}
+
 module.exports = {
   CATEGORY_LABELS,
   classifyBackendFailure,
+  generationErrorCategory,
+  ERROR_CATEGORY_HEADER,
 };

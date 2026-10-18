@@ -15,6 +15,7 @@ import {
   chatWithLlm,
   inspectModelFile
 } from "../services/api";
+import { describeGenerationFailure } from "../services/generationFailure.js";
 
 const GalleryItem = memo(({ img, idx, isSelected, onClick }) => {
   const handleClick = (e) => {
@@ -69,6 +70,7 @@ function Generator({
   const [isRestartingBackend, setIsRestartingBackend] = useState(false);
   const [restartLoadProgress, setRestartLoadProgress] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [generationFailure, setGenerationFailure] = useState(null);
   const [modelWarnings, setModelWarnings] = useState([]);
   const [modelCompatibility, setModelCompatibility] = useState([]);
   const [isDecoding, setIsDecoding] = useState(false);
@@ -194,6 +196,7 @@ function Generator({
     if (!prompt.trim()) return;
 
     setErrorMsg(null);
+    setGenerationFailure(null);
     setIsRestartingBackend(true);
     setRestartLoadProgress(null);
 
@@ -503,6 +506,11 @@ function Generator({
       } else {
         console.error("Generation failed:", e);
         setErrorMsg(e.message || "Generation failed. Please try again.");
+        setGenerationFailure(describeGenerationFailure({
+          category: e.category || "unknown",
+          message: e.message,
+          raw: e.raw || e.message,
+        }));
       }
       if (timerRef.current) clearInterval(timerRef.current);
     } finally {
@@ -963,9 +971,24 @@ function Generator({
                 <p style={{ margin: 0, fontSize: "0.95rem", opacity: 0.9, maxWidth: "320px", lineHeight: "1.4" }}>
                   {errorMsg}
                 </p>
-                <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.8, color: "var(--md-sys-color-on-surface-variant)" }}>
-                  Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).
-                </div>
+                {generationFailure ? (
+                  <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.9, color: "var(--md-sys-color-on-surface-variant)", maxWidth: "420px", lineHeight: "1.4", textAlign: "left" }}>
+                    <div style={{ fontWeight: 600 }}>{generationFailure.title}</div>
+                    <div>{generationFailure.action}</div>
+                    {generationFailure.showsSizeHint && (
+                      <div>Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).</div>
+                    )}
+                    <details style={{ marginTop: "6px" }}>
+                      <summary style={{ cursor: "pointer" }}>Diagnostic (sanitized)</summary>
+                      <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: "160px", overflow: "auto", fontSize: "0.75rem" }}>{generationFailure.raw}</pre>
+                      {generationFailure.rawTruncated && <div style={{ fontSize: "0.75rem" }}>The diagnostic was shortened.</div>}
+                    </details>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.8, color: "var(--md-sys-color-on-surface-variant)" }}>
+                    Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).
+                  </div>
+                )}
               </div>
             ) : (
               <div style={{ textAlign: "center" }}>

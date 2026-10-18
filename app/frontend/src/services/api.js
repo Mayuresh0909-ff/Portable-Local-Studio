@@ -1,5 +1,6 @@
 // Tauri API helper for desktop mode, falling back to HTTP/Mock in browser
 import { invoke } from "@tauri-apps/api/core";
+import { createGenerationFailure } from "./generationFailure.js";
 
 // Helper to check if running inside Tauri desktop container
 export const isTauri = () => {
@@ -1043,17 +1044,25 @@ export async function generateImage(prompt, negativePrompt, constraints, activeM
         };
       }
     } else {
-      let errMsg = `Generation failed (HTTP ${response.status})`;
-      try {
-        const errJson = await response.json();
-        if (errJson?.detail || errJson?.error?.message) {
-          errMsg = errJson.detail || errJson.error.message;
-        }
-      } catch (_) {}
-      throw new Error(errMsg);
+      // The body is kept as a sanitized diagnostic. The category comes from the server header.
+      // Nothing is retried and no other backend is tried.
+      const rawText = await response.text().catch(() => "");
+      let parsed = null;
+      try { parsed = JSON.parse(rawText || "null"); } catch (_) { parsed = null; }
+      const bodyMessage = typeof parsed?.detail === "string" ? parsed.detail
+        : typeof parsed?.error === "string" ? parsed.error
+        : typeof parsed?.error?.message === "string" ? parsed.error.message
+        : null;
+      const category = response.headers?.get?.("X-Studio-Error-Category") || parsed?.errorCategory || null;
+      throw createGenerationFailure({
+        status: response.status,
+        category,
+        message: bodyMessage || `Generation failed (HTTP ${response.status})`,
+        raw: rawText || `HTTP ${response.status}`,
+      });
     }
   } catch (err) {
-    if (err.name === "AbortError" || err.message.startsWith("Generation failed")) throw err;
+    if (err.name === "AbortError" || err.generationFailure || err.message.startsWith("Generation failed")) throw err;
     console.warn("Could not reach local server.", err);
     throw new Error(
       "The image generation server is not responding or crashed. " +

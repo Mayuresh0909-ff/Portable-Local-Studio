@@ -39,7 +39,7 @@ const {
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
 const { inspectSafetensorsFile, warningsForReport, compatibilityForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
-const { classifyBackendFailure } = require("./failure-classification.cjs");
+const { classifyBackendFailure, generationErrorCategory, ERROR_CATEGORY_HEADER } = require("./failure-classification.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -3756,15 +3756,44 @@ function proxyImageBackendRequest(req, res) {
     // minutes on low-memory systems. Let the browser/user control cancellation.
     timeout: 0,
   }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode || 502, {
-      ...proxyRes.headers,
-      "Access-Control-Allow-Origin": "*",
+    const status = proxyRes.statusCode || 502;
+    if (status < 400) {
+      res.writeHead(status, {
+        ...proxyRes.headers,
+        "Access-Control-Allow-Origin": "*",
+      });
+      proxyRes.pipe(res);
+      return;
+    }
+    // An error response is read in full so its cause can be classified. The body is sent unchanged.
+    const chunks = [];
+    proxyRes.on("data", (chunk) => chunks.push(chunk));
+    proxyRes.on("end", () => {
+      const buffer = Buffer.concat(chunks);
+      const headers = {
+        ...proxyRes.headers,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": ERROR_CATEGORY_HEADER,
+        [ERROR_CATEGORY_HEADER]: generationErrorCategory({ body: buffer.toString("utf8"), backendError, platform: osPlatform }),
+      };
+      delete headers["transfer-encoding"];
+      headers["content-length"] = String(buffer.length);
+      res.writeHead(status, headers);
+      res.end(buffer);
     });
-    proxyRes.pipe(res);
+    proxyRes.on("error", () => res.destroy());
   });
 
   proxyReq.on("error", (err) => {
-    json(res, 502, { ok: false, error: `Image backend is not reachable: ${err.message}` });
+    if (res.headersSent) { res.destroy(); return; }
+    const category = generationErrorCategory({ backendError, platform: osPlatform });
+    res.writeHead(502, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": ERROR_CATEGORY_HEADER,
+      [ERROR_CATEGORY_HEADER]: category,
+    });
+    res.end(JSON.stringify({ ok: false, error: `Image backend is not reachable: ${err.message}`, errorCategory: category }));
   });
   proxyReq.on("timeout", () => {
     proxyReq.destroy(new Error("Image backend request timed out"));
