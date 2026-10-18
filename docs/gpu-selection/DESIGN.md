@@ -104,9 +104,9 @@ labelled `Automatic device selection (device not confirmed)`. That label deliber
 
 | File | Status | Notes |
 |---|---|---|
-| `scripts/server/gpu-selection.cjs` | new, 643 lines | pure logic |
+| `scripts/server/gpu-selection.cjs` | new, 962 lines | pure logic (no I/O) |
 | `scripts/server/serve.cjs` | modified, +405 / -168 | discovery, probes, launch, routes |
-| `scripts/tests/gpu-selection.test.cjs` | new, 642 lines | 40 tests |
+| `scripts/tests/gpu-selection.test.cjs` | new, 665 lines | 41 tests |
 | `scripts/tests/backend-probe.test.cjs` | new | 37 tests (probe-output classification) |
 | `docs/gpu-selection/DIAGNOSIS.md` | new | root cause |
 | `docs/gpu-selection/DESIGN.md` | new | this file |

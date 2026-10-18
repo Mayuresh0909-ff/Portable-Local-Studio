@@ -130,6 +130,8 @@ generate an image. It writes one new JSON file and does not overwrite an earlier
 ```powershell
 cd <repository folder>
 node scripts/capture-gpu-evidence.cjs
+# optional: if the app is running on another port
+node scripts/capture-gpu-evidence.cjs --api-port 1420
 ```
 
 Check, in the printed summary and in `gpu-evidence/gpu-evidence-<time>.json`:
@@ -140,6 +142,15 @@ Check, in the printed summary and in `gpu-evidence/gpu-evidence-<time>.json`:
 - `initConfirmed`: `true` means the backend reached model loading on that device. `false` means the device
   was not confirmed.
 - `probeError`: `timeout` or `start` means the probe never gave a verdict.
+- `nvidiaSmi.attempts`: every nvidia-smi query that was run, in order, with its stdout and stderr. A query
+  that the driver rejected is kept here, so the field that was refused is visible.
+- `backends[].probes[].attempts`: each probe run, in order. A `primary` attempt (with `--backend`) and a
+  `fallback` attempt (without it) are both kept. Each has its `exitCode`, `errorCode`, `timedOut`, `stdout`,
+  and `stderr`. Long streams are cut, and the cut is marked `truncated`.
+- `backends[].version.value`: the backend version only when the probe output prints a version line. `null`
+  means it could not be determined. This is not an error. The backend was not asked for `--version`.
+- `localApi`: the selected backend and device, if the app is running on loopback. The default port is 1420, or
+  set `--api-port <port>`. `reachable: false` is fine, because the capture does not depend on the app.
 - `hardwareVerified` is always `false`. This run does not prove that an image was generated on the GPU. Step 4
   of this document is still required.
 

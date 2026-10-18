@@ -183,3 +183,13 @@ test("an unreadable runtime seam value fails closed: refresh is refused", { skip
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Source-text check for the live wiring (the route tests above use the test seam, not the live
+// processes). It confirms that the guard reads all four live runtime states.
+test("source: the live guard reads the image, text, OpenVINO and generation state", () => {
+  const serve = fs.readFileSync(SERVE, "utf8");
+  assert.match(serve, /imageRunning: backendProc !== null,/);
+  assert.match(serve, /textRunning: llmProc !== null,/);
+  assert.match(serve, /openvinoRunning: openvinoProc !== null,/);
+  assert.match(serve, /generating: generationState\.active,/);
+});
