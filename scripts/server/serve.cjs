@@ -3343,13 +3343,29 @@ function getSelectedBackendDeviceSummary(kind) {
 // is re-checked after GPU_NEGATIVE_CACHE_TTL_MS or when called with refresh.
 // Throws when a discovery refresh must not run now. Used by both refresh routes and by the
 // automatic re-check in getBackendOptions, so no path can re-probe while a runtime is active.
+// Test seam for the route harness (scripts/tests/refresh-route.test.cjs). It is unset in normal use.
+// When UAIS_TEST_RUNTIME_FLAGS holds a JSON object, that object replaces the live runtime flags, so
+// the real HTTP routes can be tested without starting a backend. An unreadable value fails closed,
+// as if a runtime were active.
+function discoveryGuardRuntimeFlags() {
+  const override = process.env.UAIS_TEST_RUNTIME_FLAGS;
+  if (override === undefined || override === "") {
+    return {
+      imageRunning: backendProc !== null,
+      textRunning: llmProc !== null,
+      openvinoRunning: openvinoProc !== null,
+      generating: generationState.active,
+    };
+  }
+  try {
+    return JSON.parse(override) || {};
+  } catch {
+    return { imageRunning: true };
+  }
+}
+
 function currentDiscoveryRefreshBlock() {
-  return discoveryRefreshBlockedReason({
-    imageRunning: backendProc !== null,
-    textRunning: llmProc !== null,
-    openvinoRunning: openvinoProc !== null,
-    generating: generationState.active,
-  });
+  return discoveryRefreshBlockedReason(discoveryGuardRuntimeFlags());
 }
 
 function assertDiscoveryRefreshAllowed() {
