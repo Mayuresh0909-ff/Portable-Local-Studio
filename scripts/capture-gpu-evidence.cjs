@@ -9,10 +9,13 @@
 //      No model is loaded and no image is generated. Every attempt is recorded separately: the
 //      primary attempt and, if the backend rejects device flags, the fallback attempt. Each one
 //      keeps its arguments, exit code, timeout or spawn error, stdout, and stderr.
-//   3. Reads the backend version only from a version line in the probe output. It does not run
-//      --version, and it never derives a version from a file name.
-//   4. If the local app API is running on loopback, reads the selected backend and device from
-//      /api/backend-status with a short timeout. If the API is not reachable, the capture still runs.
+//   3. Reads the backend version only from a stable-diffusion.cpp version banner in the probe output.
+//      It does not run --version, and it never derives a version from a file name. Without a banner,
+//      the version is reported as not determined.
+//   4. If the local app API is running on loopback, reads it with short timeouts and three GETs:
+//      /api/backend-status, /api/backend-options (no refresh), and /api/generation-progress. It keeps
+//      configured settings, backend-reported identity, and last-generation device in separate fields.
+//      If the API is not reachable, the capture still runs.
 //   5. Writes one JSON report (it never overwrites an earlier report) and prints a short summary.
 //
 // What it does NOT do: change drivers or Windows settings, download anything, or write to
@@ -95,18 +98,33 @@ function boundText(text, { head = STREAM_HEAD_CHARS, tail = STREAM_TAIL_CHARS } 
   };
 }
 
+// Plain-string clip for short fields (labels, reasons). Longer values are cut and marked, and paths are redacted.
+function shortText(value, max = 300) {
+  const text = String(value);
+  const clipped = text.length > max ? `${text.slice(0, max)}...[truncated]` : text;
+  return redactText(clipped);
+}
+
 // ── Backend version (from probe output only) ─────────────────────────────────────
 
-const VERSION_PATTERN = /\bversion\s*[:=]?\s*v?([A-Za-z0-9][A-Za-z0-9._+-]{0,39})/i;
+// A version is accepted only from a stable-diffusion.cpp banner line of the form
+//   stable-diffusion.cpp ... version ... master-<number>-<hex 7-40>
+// Any other line is ignored: driver, CUDA runtime, cuBLAS, cuDNN and ggml lines are rejected even
+// when they say "version", and so is output that is not recognised. The banner format is not
+// confirmed from real bundled output, so the default result is "not determined".
+const BANNER_NAME_PATTERN = /stable-diffusion\.cpp/i;
+const BANNER_VERSION_PATTERN = /\bversion\b[^\r\n]*?\b(master-\d+-[0-9a-f]{7,40})\b/i;
+const BANNER_REJECT_PATTERN = /driver|runtime|cudart|cublas|cudnn|ggml/i;
 
-// Finds a "version: <value>" line that contains a digit. Scans a bounded number of lines and does
-// not run anything. Returns { value, evidence } or null.
+// Scans a bounded number of lines and does not run anything. Returns { value, evidence } or null.
 function extractBackendVersion(text) {
   const lines = String(text || "").split(/\r?\n/).slice(0, VERSION_SCAN_LINES);
   for (const line of lines) {
     const clipped = line.slice(0, VERSION_LINE_CHARS);
-    const match = clipped.match(VERSION_PATTERN);
-    if (match && /\d/.test(match[1])) {
+    if (!BANNER_NAME_PATTERN.test(clipped)) continue;
+    if (BANNER_REJECT_PATTERN.test(clipped)) continue;
+    const match = clipped.match(BANNER_VERSION_PATTERN);
+    if (match) {
       return { value: match[1], evidence: redactText(clipped.trim()) };
     }
   }
@@ -123,7 +141,7 @@ function describeBackendVersion(probes) {
   return {
     value: null,
     determined: false,
-    method: "version line in probe output",
+    method: "stable-diffusion.cpp version banner in probe output",
     evidence: null,
     note: "Not printed in the probe output. The backend was not asked for --version because its support for that flag is unknown, and a binary that ignores unknown flags could start a server.",
   };
@@ -259,7 +277,7 @@ function probeDevice({ kind, binaryPath, cliName, missingModelPath, platform, ru
     errorCode: last.errorCode || null,
     outputTail: output.slice(-OUTPUT_TAIL_CHARS),
     attempts: recorded,
-    backendVersion: backendVersion ? { value: backendVersion.value, method: "version line in probe output", evidence: backendVersion.evidence } : null,
+    backendVersion: backendVersion ? { value: backendVersion.value, method: "stable-diffusion.cpp version banner in probe output", evidence: backendVersion.evidence } : null,
   };
   probe.summary = describeProbe(probe);
   return probe;
@@ -344,10 +362,11 @@ function describeNvidiaDevice(device) {
 // ── Local API (optional, loopback only) ──────────────────────────────────────────
 
 // One GET on loopback with a timeout. Resolves { status, body } or rejects with an error.
-// The body read is bounded. A longer body is cut and the flag says so.
-function getLoopbackJson({ port, timeoutMs }) {
+// The body read is bounded. A longer body is cut and the flag says so. Only the fixed paths below
+// are requested, and none of them uses a query string, so no refresh can be triggered.
+function getLoopbackJson({ port, timeoutMs, path: requestPath = LOCAL_API_PATH }) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: LOCAL_API_HOST, port, path: LOCAL_API_PATH, timeout: timeoutMs }, (res) => {
+    const req = http.get({ host: LOCAL_API_HOST, port, path: requestPath, timeout: timeoutMs }, (res) => {
       let body = "";
       let truncated = false;
       res.setEncoding("utf8");
@@ -365,43 +384,117 @@ function getLoopbackJson({ port, timeoutMs }) {
   });
 }
 
-// Reads the selected backend and device from the running app. Never throws and never rejects. A
-// failure is recorded as reachable: false, and the capture carries on.
+// Reads one endpoint as JSON. Never throws: the result says what happened.
+async function readLocalJson(request, { port, timeoutMs, path: requestPath }) {
+  try {
+    const response = await request({ port, timeoutMs, path: requestPath });
+    if (response.status !== 200) return { ok: false, httpStatus: response.status ?? null, error: `HTTP ${response.status}`, data: null };
+    try {
+      return { ok: true, httpStatus: 200, error: null, data: JSON.parse(response.body), bodyTruncated: response.bodyTruncated === true };
+    } catch {
+      return { ok: false, httpStatus: 200, error: "The response was not JSON.", data: null };
+    }
+  } catch (error) {
+    return { ok: false, httpStatus: null, error: redactText(error && error.message ? error.message : String(error)), data: null };
+  }
+}
+
+// Summary of one backend's device as the app's own selection reports it. Only identity and
+// initialization fields are copied. Model paths and other fields are not.
+function summarizeReportedDevice(selection) {
+  if (!selection || typeof selection !== "object") return null;
+  const device = selection.device && typeof selection.device === "object" ? selection.device : null;
+  return {
+    installed: selection.installed ?? null,
+    available: selection.available ?? null,
+    reason: selection.reason ? shortText(String(selection.reason)) : null,
+    device: device ? {
+      index: device.index ?? null,
+      name: device.name ?? null,
+      candidateName: device.candidateName ?? null,
+      pinned: device.pinned ?? null,
+      identityConfirmed: device.identityConfirmed ?? null,
+      initConfirmed: device.initConfirmed ?? null,
+      displayActive: device.displayActive ?? null,
+    } : null,
+  };
+}
+
+// Reads the running app over loopback. Never throws and never rejects. The app has three
+// separate kinds of identity, and each is kept in its own field:
+//   configuredSettings        what the app is set to use (backend type, GPU on or off);
+//   backendReportedSelection  what the backend reported: the log-confirmed device label and the
+//                             app's device selection (from backend-options, read without refresh);
+//   lastGenerationDevice      the device used by the last generation. The app does not record this,
+//                             so the record says so and does not guess.
+// If /api/backend-status is not reachable, the other reads are skipped and the capture carries on.
 async function checkLocalApi({ port, timeoutMs = LOCAL_API_TIMEOUT_MS, request = getLoopbackJson } = {}) {
   const url = `http://${LOCAL_API_HOST}:${port}${LOCAL_API_PATH}`;
-  try {
-    const response = await request({ port, timeoutMs });
-    const record = { checked: true, url, reachable: true, httpStatus: response.status ?? null, bodyTruncated: response.bodyTruncated === true };
-    if (response.status !== 200) return { ...record, selected: null, error: `HTTP ${response.status}` };
-    let parsed;
-    try {
-      parsed = JSON.parse(response.body);
-    } catch {
-      return { ...record, selected: null, error: "The response was not JSON." };
-    }
-    const settings = parsed.settings && typeof parsed.settings === "object" ? parsed.settings : {};
+  const status = await readLocalJson(request, { port, timeoutMs, path: LOCAL_API_PATH });
+  if (!status.ok && status.httpStatus === null) {
     return {
-      ...record,
-      selected: {
-        backendType: settings.backendType ?? null,
-        backendDevice: settings.backendDevice ?? null,
-        useGpu: settings.useGpu ?? null,
-      },
-      ready: parsed.ready ?? null,
-      running: parsed.running ?? null,
-      errorCategory: parsed.errorCategory ?? null,
-      error: parsed.error ? boundText(parsed.error, { head: 500, tail: 200 }) : null,
-    };
-  } catch (error) {
-    return {
-      checked: true,
-      url,
-      reachable: false,
-      httpStatus: null,
-      selected: null,
-      error: redactText(error && error.message ? error.message : String(error)),
+      checked: true, url, reachable: false, httpStatus: null, bodyTruncated: false,
+      error: status.error, configuredSettings: null, runtime: null, backendReportedSelection: null, lastGenerationDevice: null,
     };
   }
+  const record = { checked: true, url, reachable: true, httpStatus: status.httpStatus, bodyTruncated: status.bodyTruncated === true };
+  if (!status.ok) {
+    return { ...record, error: status.error, configuredSettings: null, runtime: null, backendReportedSelection: null, lastGenerationDevice: null };
+  }
+
+  const body = status.data && typeof status.data === "object" ? status.data : {};
+  const settings = body.settings && typeof body.settings === "object" ? body.settings : {};
+  const loading = body.loading && typeof body.loading === "object" ? body.loading : {};
+  const loggedDeviceLabel = typeof loading.device === "string" && loading.device.trim() ? shortText(loading.device.trim()) : null;
+  // The label is written only after the backend's own log names the device. The "not confirmed"
+  // wording is the app's label for an unconfirmed device, so it does not count as confirmed.
+  const logConfirmed = loggedDeviceLabel !== null && !/not confirmed/i.test(loggedDeviceLabel);
+
+  const backendType = typeof settings.backendType === "string" ? settings.backendType : null;
+  const options = await readLocalJson(request, { port, timeoutMs, path: "/api/backend-options" });
+  const selection = options.ok && options.data && options.data.selection && typeof options.data.selection === "object"
+    ? options.data.selection
+    : null;
+  const kindSummary = (kind) => (selection ? summarizeReportedDevice(selection[kind]) : null);
+
+  const progress = await readLocalJson(request, { port, timeoutMs, path: "/api/generation-progress" });
+  const progressBody = progress.ok && progress.data && typeof progress.data === "object" ? progress.data : {};
+
+  return {
+    ...record,
+    error: body.error ? shortText(String(body.error)) : null,
+    configuredSettings: {
+      backendType,
+      useGpu: settings.useGpu ?? null,
+      // The app writes this label again when the backend log confirms a device, so it is shown
+      // for reference only and is not counted as configuration.
+      deviceLabelInSettings: typeof settings.backendDevice === "string" ? shortText(settings.backendDevice) : null,
+    },
+    runtime: {
+      ready: body.ready ?? null,
+      running: body.running ?? null,
+      errorCategory: body.errorCategory ?? null,
+      loadPhase: typeof loading.phase === "string" ? loading.phase : null,
+      loadBackendMode: typeof loading.backendMode === "string" ? loading.backendMode : null,
+    },
+    backendReportedSelection: {
+      source: "loggedDeviceLabel from /api/backend-status; cuda/vulkan from /api/backend-options (read without refresh)",
+      loggedDeviceLabel,
+      confirmed: logConfirmed,
+      optionsReachable: options.ok,
+      optionsError: options.ok ? null : options.error,
+      cuda: kindSummary("cuda"),
+      vulkan: kindSummary("vulkan"),
+    },
+    lastGenerationDevice: {
+      recorded: false,
+      reason: "The app does not record which device each generation used. The progress endpoint's backendDevice is the current backend label, not a record from the last generation.",
+      generationActive: typeof progressBody.active === "boolean" ? progressBody.active : null,
+      currentBackendLabel: typeof progressBody.backendDevice === "string" && progressBody.backendDevice ? shortText(progressBody.backendDevice) : null,
+      progressReachable: progress.ok,
+      progressError: progress.ok ? null : progress.error,
+    },
+  };
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────────
@@ -430,9 +523,15 @@ function buildEvidenceReport({ capturedAt, platform, nvidiaSmi, backends, notes 
         return [version, ...backend.probes.map((probe) => `${backend.kind}: ${probe.summary}`)];
       }),
       ...(localApi && localApi.checked
-        ? [localApi.reachable
-          ? `Local API: selected backend ${localApi.selected ? localApi.selected.backendType : "unknown"}.`
-          : `Local API: not reachable (${localApi.error || "no reason reported"}). The capture did not depend on it.`]
+        ? (localApi.reachable
+          ? [
+            `Local API configured backend: ${localApi.configuredSettings && localApi.configuredSettings.backendType ? localApi.configuredSettings.backendType : "unknown"} (configured settings, not a device report).`,
+            localApi.backendReportedSelection && localApi.backendReportedSelection.confirmed
+              ? `Local API backend-reported device: ${localApi.backendReportedSelection.loggedDeviceLabel} (named by the backend's own log).`
+              : "Local API backend-reported device: not confirmed by the backend's log.",
+            "Local API last-generation device: not recorded by the app.",
+          ]
+          : [`Local API: not reachable (${localApi.error || "no reason reported"}). The capture did not depend on it.`])
         : []),
     ],
     notes,

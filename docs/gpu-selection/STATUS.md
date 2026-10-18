@@ -46,7 +46,7 @@ was not observed or checked by any run in this repository.
 ## What is not verified
 
 - No test in this repository has run on the RTX 5060 or on Windows.
-- The NVIDIA query fallback, the backend version line, and the failure texts are checked against fake
+- The NVIDIA query fallback, the backend version banner (no banner means "not determined"), the separate backend-status identity fields, and the failure texts are checked against fake
   output. The real drivers and backend binaries may print other text.
 - The refresh-guard route tests use a test seam (`UAIS_TEST_RUNTIME_FLAGS`) for the runtime state. They do
   not start a real backend.
@@ -61,7 +61,8 @@ was not observed or checked by any run in this repository.
 ## Windows checks still needed
 
 1. `node scripts/capture-gpu-evidence.cjs` on the laptop. Check `nvidiaSmi.devices` (driver version, compute
-   capability, bus ID), `nvidiaSmi.attempts`, each probe's `attempts`, `backends[].version`, and `localApi`.
+   capability, bus ID), `nvidiaSmi.attempts`, each probe's `attempts`, `backends[].version`, and `localApi`
+   (`configuredSettings`, `backendReportedSelection`, and `lastGenerationDevice` are separate; the last is not recorded by the app).
 2. The refresh 409 with a real image runtime running (`WINDOWS_ACCEPTANCE.md`).
 3. A generation failure on purpose (for example a very large size) and the panel text. Check whether the
    category matches what the backend printed.

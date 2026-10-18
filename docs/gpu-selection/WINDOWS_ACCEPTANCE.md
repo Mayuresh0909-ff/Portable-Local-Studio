@@ -147,10 +147,19 @@ Check, in the printed summary and in `gpu-evidence/gpu-evidence-<time>.json`:
 - `backends[].probes[].attempts`: each probe run, in order. A `primary` attempt (with `--backend`) and a
   `fallback` attempt (without it) are both kept. Each has its `exitCode`, `errorCode`, `timedOut`, `stdout`,
   and `stderr`. Long streams are cut, and the cut is marked `truncated`.
-- `backends[].version.value`: the backend version only when the probe output prints a version line. `null`
-  means it could not be determined. This is not an error. The backend was not asked for `--version`.
-- `localApi`: the selected backend and device, if the app is running on loopback. The default port is 1420, or
-  set `--api-port <port>`. `reachable: false` is fine, because the capture does not depend on the app.
+- `backends[].version.value`: the backend version only when the probe output prints a stable-diffusion.cpp
+  version banner (`stable-diffusion.cpp ... version master-<number>-<hex>`). Driver, CUDA runtime, and ggml
+  lines are never used. `determined: false` (`value: null`) is the expected result when no banner is
+  printed. This is not an error. The backend was not asked for `--version`.
+- `localApi`: if the app is running on loopback, three read-only GETs are made (`/api/backend-status`,
+  `/api/backend-options` without `refresh`, and `/api/generation-progress`). The default port is 1420, or set
+  `--api-port <port>`. The result keeps three things apart:
+  - `configuredSettings`: the backend type and GPU setting the app is set to use. This is configuration, not a device report.
+  - `backendReportedSelection`: `loggedDeviceLabel` and `confirmed` (true only when the backend's own log named
+    the device), plus the app's `cuda` and `vulkan` device summaries, with `identityConfirmed` and `initConfirmed`.
+  - `lastGenerationDevice`: `recorded: false`. The app does not record which device each generation used, so
+    this capture cannot report it. `currentBackendLabel` is the current label only.
+  `reachable: false` is fine, because the capture does not depend on the app.
 - `hardwareVerified` is always `false`. This run does not prove that an image was generated on the GPU. Step 4
   of this document is still required.
 

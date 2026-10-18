@@ -354,10 +354,47 @@ test("a missing binary is reported as not present and nothing is run", () => {
   assert.equal(report.backends[0].version, null);
 });
 
-test("version: a version line in the probe output is reported, with its evidence", () => {
+test("version: a stable-diffusion.cpp version banner with a master identifier is reported, with its evidence", () => {
   const found = capture.extractBackendVersion("stable-diffusion.cpp\nstable-diffusion.cpp version: master-782-b290693\nloading");
   assert.equal(found.value, "master-782-b290693");
   assert.match(found.evidence, /version: master-782-b290693/);
+  const logged = capture.extractBackendVersion("[INFO ] stable-diffusion.cpp:1234 - stable-diffusion.cpp version master-1024-a1b2c3d4e5 loaded");
+  assert.equal(logged.value, "master-1024-a1b2c3d4e5");
+});
+
+test("version: lines that are not a stable-diffusion.cpp banner are never accepted", () => {
+  const notBanners = [
+    "CUDA Driver Version: 581.80",
+    "NVIDIA-SMI 581.80   Driver Version: 581.80   CUDA Version: 13.0",
+    "cudart version: 12.8",
+    "cuBLAS version: 12.8.4",
+    "cuDNN version: 9.10",
+    "ggml version: 0.9.1",
+    "llama.cpp version: master-782-b290693",
+    "stable-diffusion.cpp version: unknown",
+    "stable-diffusion.cpp version: 1.2.3",
+    "stable-diffusion.cpp version master-12-xyz1234",
+    "stable-diffusion.cpp: CUDA driver version master-782-b290693",
+    "stable-diffusion.cpp ggml version master-782-b290693",
+    "unknown",
+    "",
+  ];
+  for (const line of notBanners) {
+    assert.equal(capture.extractBackendVersion(line), null, `must not accept: ${line}`);
+  }
+});
+
+test("version: output with only driver or runtime version lines is reported as not determined", () => {
+  const dir = tempDir("ver-driver");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => ({ stdout: "CUDA Driver Version: 581.80\ncudart version: 12.8\n", stderr: "", output: "CUDA Driver Version: 581.80\ncudart version: 12.8\n", exitCode: 1, errorCode: null }),
+  });
+  assert.equal(report.backends[0].version.value, null);
+  assert.equal(report.backends[0].version.determined, false);
+  assert.match(report.summary.join("\n"), /cuda backend version: could not be determined/);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("version: unsupported output (a rejected --version flag) is reported as not determined, not guessed", () => {
@@ -397,22 +434,116 @@ test("nvidia-smi attempts are recorded with raw stderr, and absent fields are ex
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("local API: a loopback response is read, and the selected backend and device are recorded", async () => {
+// A fake app API for the three read-only endpoints. Every requested path is recorded.
+function startFakeApp({ status, options, progress }) {
+  const seen = [];
   const server = http.createServer((req, res) => {
+    seen.push(req.url);
+    const routes = { "/api/backend-status": status, "/api/backend-options": options, "/api/generation-progress": progress };
+    const entry = routes[req.url.split("?")[0]];
+    if (!entry) { res.writeHead(404); res.end("{}"); return; }
+    if (entry.httpStatus && entry.httpStatus !== 200) { res.writeHead(entry.httpStatus); res.end("{}"); return; }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ready: true, running: true, errorCategory: null, settings: { backendType: "cuda", backendDevice: "cuda0", useGpu: true, model: "/x/y.safetensors" } }));
+    res.end(JSON.stringify(entry.body));
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen, port: server.address().port })));
+}
+
+const CONFIRMED_LABEL = "NVIDIA GeForce RTX 5060 Laptop GPU [cuda0]";
+
+test("local API: configured settings, backend-reported identity, and last-generation device are separate fields", async () => {
+  const app = await startFakeApp({
+    status: { body: {
+      ready: true, running: true, errorCategory: null,
+      settings: { backendType: "cuda", backendDevice: CONFIRMED_LABEL, useGpu: true, model: "/x/y.safetensors" },
+      loading: { active: false, phase: "Ready", backendMode: "CUDA GPU", device: CONFIRMED_LABEL, model: "/x/y.safetensors" },
+    } },
+    options: { body: { selection: {
+      cuda: { installed: true, available: true, reason: null, device: { index: 0, name: "NVIDIA GeForce RTX 5060 Laptop GPU", candidateName: null, pinned: true, identityConfirmed: true, initConfirmed: true, displayActive: false, vramGb: 8, source: "nvidia-smi", path: "/secret/sd" } },
+      vulkan: { installed: false, available: false, reason: "not installed", device: null },
+    } } },
+    progress: { body: { active: false, backendDevice: CONFIRMED_LABEL, backendMode: "CUDA GPU" } },
+  });
   try {
-    const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
+    const result = await capture.checkLocalApi({ port: app.port, timeoutMs: 1000 });
     assert.equal(result.reachable, true);
-    assert.equal(result.httpStatus, 200);
-    assert.equal(result.selected.backendType, "cuda");
-    assert.equal(result.selected.backendDevice, "cuda0");
-    assert.equal(Object.prototype.hasOwnProperty.call(result.selected, "model"), false, "the model path is not copied");
+    assert.deepEqual(app.seen.sort(), ["/api/backend-options", "/api/backend-status", "/api/generation-progress"]);
+    assert.equal(result.configuredSettings.backendType, "cuda");
+    assert.equal(result.configuredSettings.useGpu, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(result.configuredSettings, "model"), false, "the model path is not copied");
+    assert.equal(result.backendReportedSelection.confirmed, true);
+    assert.equal(result.backendReportedSelection.loggedDeviceLabel, CONFIRMED_LABEL);
+    assert.equal(result.backendReportedSelection.cuda.device.name, "NVIDIA GeForce RTX 5060 Laptop GPU");
+    assert.equal(result.backendReportedSelection.cuda.device.identityConfirmed, true);
+    assert.equal(result.backendReportedSelection.cuda.device.initConfirmed, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(result.backendReportedSelection.cuda.device, "path"), false, "no other fields are copied");
+    assert.equal(result.lastGenerationDevice.recorded, false, "the app does not record a per-generation device");
+    assert.equal(result.lastGenerationDevice.generationActive, false);
+    assert.equal(result.lastGenerationDevice.currentBackendLabel, CONFIRMED_LABEL);
+    assert.equal(JSON.stringify(result).includes("/secret/sd"), false);
   } finally {
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => app.server.close(resolve));
+  }
+});
+
+test("local API: a 'not confirmed' device label does not count as confirmed by the backend", async () => {
+  const app = await startFakeApp({
+    status: { body: { ready: false, running: false, settings: { backendType: "cuda", useGpu: true }, loading: { device: "Automatic device selection (device not confirmed)" } } },
+    options: { body: { selection: {} } },
+    progress: { body: { active: false, backendDevice: "" } },
+  });
+  try {
+    const result = await capture.checkLocalApi({ port: app.port, timeoutMs: 1000 });
+    assert.equal(result.backendReportedSelection.confirmed, false);
+    assert.equal(result.backendReportedSelection.cuda, null);
+    assert.equal(result.lastGenerationDevice.currentBackendLabel, null);
+    const report = capture.buildEvidenceReport({ capturedAt: "2026-10-18T10:00:00.000Z", platform: "linux", nvidiaSmi: RTX_SMI, backends: [], localApi: result });
+    assert.match(report.summary.join("\n"), /not confirmed by the backend's log/);
+  } finally {
+    await new Promise((resolve) => app.server.close(resolve));
+  }
+});
+
+test("local API: a failed backend-options read does not fail the status read or the capture", async () => {
+  const app = await startFakeApp({
+    status: { body: { ready: true, running: true, settings: { backendType: "cuda", useGpu: true }, loading: { device: CONFIRMED_LABEL } } },
+    options: { httpStatus: 500, body: {} },
+    progress: { httpStatus: 500, body: {} },
+  });
+  try {
+    const result = await capture.checkLocalApi({ port: app.port, timeoutMs: 1000 });
+    assert.equal(result.reachable, true);
+    assert.equal(result.configuredSettings.backendType, "cuda");
+    assert.equal(result.backendReportedSelection.confirmed, true, "the log-confirmed label is still reported");
+    assert.equal(result.backendReportedSelection.optionsReachable, false);
+    assert.equal(result.backendReportedSelection.optionsError, "HTTP 500");
+    assert.equal(result.lastGenerationDevice.progressReachable, false);
+    assert.equal(result.lastGenerationDevice.recorded, false);
+  } finally {
+    await new Promise((resolve) => app.server.close(resolve));
+  }
+});
+
+test("local API: no read uses refresh or a query string, and an unreachable status skips the rest", async () => {
+  const paths = [];
+  const failing = async ({ path: requestPath }) => { paths.push(requestPath); throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }); };
+  const result = await capture.checkLocalApi({ port: 1, timeoutMs: 500, request: failing });
+  assert.equal(result.reachable, false);
+  assert.deepEqual(paths, ["/api/backend-status"], "the other reads are skipped when the status read fails");
+  assert.equal(result.configuredSettings, null);
+  assert.equal(result.backendReportedSelection, null);
+  assert.equal(result.lastGenerationDevice, null);
+
+  const paths2 = [];
+  const ok = async ({ path: requestPath }) => {
+    paths2.push(requestPath);
+    return { status: 200, body: JSON.stringify({ ready: false, running: false, settings: {}, loading: {}, selection: {} }), bodyTruncated: false };
+  };
+  await capture.checkLocalApi({ port: 1, timeoutMs: 500, request: ok });
+  assert.deepEqual(paths2, ["/api/backend-status", "/api/backend-options", "/api/generation-progress"]);
+  for (const requestPath of paths2) {
+    assert.doesNotMatch(requestPath, /refresh/i);
+    assert.equal(requestPath.includes("?"), false, "no query string is sent");
   }
 });
 
@@ -423,7 +554,7 @@ test("local API: a closed port is recorded as not reachable, and the check does 
   await new Promise((resolve) => server.close(resolve));
   const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
   assert.equal(result.reachable, false);
-  assert.equal(result.selected, null);
+  assert.equal(result.configuredSettings, null);
   assert.ok(result.error);
   const report = capture.buildEvidenceReport({
     capturedAt: "2026-10-17T10:00:00.000Z", platform: "linux", nvidiaSmi: RTX_SMI, backends: [], localApi: result,
@@ -455,7 +586,7 @@ test("local API: a non-JSON body is recorded as reachable but unreadable", async
   try {
     const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
     assert.equal(result.reachable, true);
-    assert.equal(result.selected, null);
+    assert.equal(result.configuredSettings, null);
     assert.match(result.error, /not JSON/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
