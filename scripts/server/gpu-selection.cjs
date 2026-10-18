@@ -569,20 +569,26 @@ function buildBackendProbeSpawnOptions(env) {
 
 // Runs one device probe. If the binary rejects --backend, the probe is retried without device
 // flags. `run(binaryPath, args, options)` must return { output, exitCode, errorCode }.
-// Returns { verdict, supportsFlags }, where verdict is the classifyBackendProbe result.
+// Returns { verdict, supportsFlags, attempts }, where verdict is the classifyBackendProbe result for
+// the last attempt. `attempts` keeps every run in order: { stage, args, result }. The primary
+// result is kept even when the fallback replaces it as the verdict.
 function runBackendProbeSequence({ run, binaryPath, cliName, missingModelPath, platform, spawnOptions }) {
-  const first = run(binaryPath, buildBackendProbeArgs({ cliName, missingModelPath }), spawnOptions);
+  const primaryArgs = buildBackendProbeArgs({ cliName, missingModelPath });
+  const first = run(binaryPath, primaryArgs, spawnOptions);
+  const attempts = [{ stage: "primary", args: primaryArgs, result: first }];
   if (!first.errorCode && shouldRetryWithoutDeviceFlags(first.output)) {
-    const fallback = run(binaryPath, buildBackendProbeFallbackArgs({ missingModelPath }), spawnOptions);
+    const fallbackArgs = buildBackendProbeFallbackArgs({ missingModelPath });
+    const fallback = run(binaryPath, fallbackArgs, spawnOptions);
+    attempts.push({ stage: "fallback", args: fallbackArgs, result: fallback });
     const verdict = classifyBackendProbe({
       ...fallback, platform, cliName, stage: "fallback", supportsFlags: false,
     });
-    return { verdict, supportsFlags: false };
+    return { verdict, supportsFlags: false, attempts };
   }
   const verdict = classifyBackendProbe({
     ...first, platform, cliName, stage: "primary", supportsFlags: true,
   });
-  return { verdict, supportsFlags: true };
+  return { verdict, supportsFlags: true, attempts };
 }
 
 // ── Refresh guard ─────────────────────────────────────────────────────────────

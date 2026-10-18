@@ -225,6 +225,250 @@ test("the report is written as JSON and an existing report is never overwritten"
   fs.rmSync(path.dirname(dir), { recursive: true, force: true });
 });
 
+// ── Evidence detail (Task 1) ───────────────────────────────────────────────────────
+
+const http = require("node:http");
+const gprunner = require(path.join(root, "scripts", "server", "gpu-probe-runner.cjs"));
+
+test("output capture: stdout and stderr are kept apart, and a long stream is cut with the cut recorded", () => {
+  const dir = tempDir("capture");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const longStdout = "x".repeat(20000);
+  const report = capture.captureGpuEvidence({
+    platform: "linux",
+    cuda,
+    vulkan: null,
+    query: () => RTX_SMI,
+    run: () => ({ stdout: longStdout, stderr: "stable-diffusion.cpp\nerror: could not open model", output: longStdout, exitCode: 1, errorCode: null }),
+  });
+  const attempt = report.backends[0].probes[0].attempts[0];
+  assert.equal(attempt.combinedOnly, false);
+  assert.equal(attempt.stdout.truncated, true, "a 20000-character stream must be cut");
+  assert.equal(attempt.stdout.originalChars, 20000);
+  assert.match(attempt.stdout.text, /\[truncated: \d+ characters omitted\]/);
+  assert.ok(attempt.stdout.text.length < 9000, "the bounded text stays small");
+  assert.equal(attempt.stderr.truncated, false);
+  assert.match(attempt.stderr.text, /could not open model/, "stderr is kept separately from stdout");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("output capture: a run that returns only combined output is recorded as combined, not split", () => {
+  const dir = tempDir("combined");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => ({ output: LOADING, exitCode: 1, errorCode: null }),
+  });
+  const attempt = report.backends[0].probes[0].attempts[0];
+  assert.equal(attempt.combinedOnly, true);
+  assert.equal(attempt.stderr, null);
+  assert.match(attempt.stdout.text, /found 1 CUDA devices/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("redaction: absolute user paths in streams and arguments are replaced", () => {
+  const home = "/home/alice";
+  const text = "loading /home/alice/models/x.safetensors and C:\\Users\\Bob\\AppData\\y and " + path.join(root, "app", "models", "m.safetensors");
+  const redacted = capture.redactText(text, { root, home });
+  assert.doesNotMatch(redacted, /alice|Bob/);
+  assert.match(redacted, /~\/models\/x\.safetensors/, "the home folder becomes ~");
+  assert.equal(capture.redactText("/home/alice/models/x", { root, home: "/srv/elsewhere" }), "/home/<user>/models/x", "other home folders are masked by pattern");
+  assert.match(redacted, /C:\\Users\\<user>\\AppData/);
+  assert.match(redacted, /<repo>\/app\/models\/m\.safetensors/);
+});
+
+test("primary and fallback attempts are both kept, with the primary's stderr and the rejected flag", () => {
+  const dir = tempDir("retain");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const results = [
+    { stdout: "", stderr: REJECTS_BACKEND, output: `\n${REJECTS_BACKEND}`, exitCode: 1, errorCode: null },
+    { stdout: "stable-diffusion.cpp", stderr: "error: could not open __backend_probe_missing__.safetensors", output: "stable-diffusion.cpp\nerror: could not open __backend_probe_missing__.safetensors", exitCode: 1, errorCode: null },
+  ];
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => results.shift(),
+  });
+  const probe = report.backends[0].probes[0];
+  assert.equal(probe.attempts.length, 2, "both attempts are kept");
+  assert.equal(probe.attempts[0].stage, "primary");
+  assert.ok(probe.attempts[0].args.includes("--backend"), "the primary attempt used device flags");
+  assert.match(probe.attempts[0].stderr.text, /unknown argument '--backend'/, "the rejected output is not discarded");
+  assert.equal(probe.attempts[1].stage, "fallback");
+  assert.equal(probe.attempts[1].args.includes("--backend"), false);
+  assert.equal(probe.stage, "fallback", "the verdict still comes from the fallback");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("timeouts: a timed-out attempt records timedOut and an ETIMEDOUT code, and is not retried", () => {
+  const dir = tempDir("timeout2");
+  const cuda = touchBinary(dir, "sd-cuda");
+  let calls = 0;
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => { calls += 1; return { stdout: "", stderr: "", output: "", exitCode: null, errorCode: "ETIMEDOUT", timedOut: true }; },
+  });
+  const probe = report.backends[0].probes[0];
+  assert.equal(calls, 1, "a timeout is not retried with other flags");
+  assert.equal(probe.attempts[0].timedOut, true);
+  assert.equal(probe.attempts[0].errorCode, "ETIMEDOUT");
+  assert.equal(probe.probeError, "timeout");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("spawn errors are recorded with their error code, not turned into output text", () => {
+  const dir = tempDir("spawnerr");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => ({ stdout: "", stderr: "", output: "", exitCode: null, errorCode: "EACCES" }),
+  });
+  const attempt = report.backends[0].probes[0].attempts[0];
+  assert.equal(attempt.errorCode, "EACCES");
+  assert.equal(attempt.timedOut, false);
+  assert.equal(attempt.exitCode, null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const POSIX_ONLY = process.platform === "win32" ? "Not run on Windows: this test uses a POSIX shell fake." : false;
+
+test("a real timed-out process is killed and reported as timedOut, and its streams are kept apart", { skip: POSIX_ONLY }, () => {
+  const dir = tempDir("realtimeout");
+  const script = writeFakeBackend(dir, "slow", "echo from-stdout\necho from-stderr 1>&2\nsleep 5");
+  const result = gprunner.runBackendProbeProcess(script, [], { encoding: "utf8", timeout: 300 });
+  assert.equal(result.errorCode, "ETIMEDOUT");
+  assert.equal(result.timedOut, true);
+  assert.match(result.stdout, /from-stdout/);
+  assert.match(result.stderr, /from-stderr/);
+  assert.match(result.output, /from-stdout/, "the combined output is still available to the classifiers");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a missing binary is reported as not present and nothing is run", () => {
+  let ran = false;
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda: path.join(os.tmpdir(), "no-such-backend-xyz"), vulkan: null, query: () => RTX_SMI,
+    run: () => { ran = true; return { output: "", exitCode: 0, errorCode: null }; },
+  });
+  assert.equal(ran, false);
+  assert.equal(report.backends[0].present, false);
+  assert.equal(report.backends[0].version, null);
+});
+
+test("version: a version line in the probe output is reported, with its evidence", () => {
+  const found = capture.extractBackendVersion("stable-diffusion.cpp\nstable-diffusion.cpp version: master-782-b290693\nloading");
+  assert.equal(found.value, "master-782-b290693");
+  assert.match(found.evidence, /version: master-782-b290693/);
+});
+
+test("version: unsupported output (a rejected --version flag) is reported as not determined, not guessed", () => {
+  assert.equal(capture.extractBackendVersion("error: unrecognized option '--version'"), null);
+  assert.equal(capture.extractBackendVersion("Unknown argument: --version"), null);
+  const dir = tempDir("ver");
+  const cuda = touchBinary(dir, "sd-server-master-782-b290693");
+  const report = capture.captureGpuEvidence({
+    platform: "linux", cuda, vulkan: null, query: () => RTX_SMI,
+    run: () => ({ stdout: "", stderr: "error: unrecognized option '--version'", output: "error: unrecognized option '--version'", exitCode: 1, errorCode: null }),
+  });
+  assert.equal(report.backends[0].version.value, null, "the file name must not supply a version");
+  assert.equal(report.backends[0].version.determined, false);
+  assert.match(report.backends[0].version.note, /not printed in the probe output/i);
+  assert.match(report.summary.join("\n"), /cuda backend version: could not be determined/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("nvidia-smi attempts are recorded with raw stderr, and absent fields are explicit nulls", () => {
+  const dir = tempDir("smi");
+  const cuda = touchBinary(dir, "sd-cuda");
+  const smi = {
+    ok: true, command: "nvidia-smi", error: null,
+    devices: [{ index: 0, name: "NVIDIA GeForce RTX 3060", vramGb: 12, freeVramGb: 11, displayActive: true, busId: "00000000:01:00.0", driverVersion: null, computeCap: null, source: "nvidia-smi" }],
+    attempts: [
+      { command: "nvidia-smi", query: "a,compute_cap", exitCode: 2, errorCode: null, stdout: "", stderr: 'Field "compute_cap" is not a valid field to query.' },
+      { command: "nvidia-smi", query: "b", exitCode: 0, errorCode: null, stdout: "0, NVIDIA GeForce RTX 3060, 12288, 11000\n", stderr: "" },
+    ],
+  };
+  const report = capture.captureGpuEvidence({ platform: "linux", cuda, vulkan: null, query: () => smi, run: () => ({ output: LOADING, exitCode: 1, errorCode: null }) });
+  assert.equal(report.nvidiaSmi.attempts.length, 2);
+  assert.match(report.nvidiaSmi.attempts[0].stderr.text, /compute_cap/);
+  assert.equal(report.nvidiaSmi.devices[0].driverVersion, null);
+  assert.equal(report.nvidiaSmi.devices[0].computeCap, null);
+  assert.equal(report.nvidiaSmi.devices[0].busId, "00000000:01:00.0");
+  assert.equal(report.backends[0].probes[0].device.index, 0, "the CUDA probe records the device it used");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("local API: a loopback response is read, and the selected backend and device are recorded", async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ready: true, running: true, errorCategory: null, settings: { backendType: "cuda", backendDevice: "cuda0", useGpu: true, model: "/x/y.safetensors" } }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
+    assert.equal(result.reachable, true);
+    assert.equal(result.httpStatus, 200);
+    assert.equal(result.selected.backendType, "cuda");
+    assert.equal(result.selected.backendDevice, "cuda0");
+    assert.equal(Object.prototype.hasOwnProperty.call(result.selected, "model"), false, "the model path is not copied");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("local API: a closed port is recorded as not reachable, and the check does not throw", async () => {
+  const server = http.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
+  assert.equal(result.reachable, false);
+  assert.equal(result.selected, null);
+  assert.ok(result.error);
+  const report = capture.buildEvidenceReport({
+    capturedAt: "2026-10-17T10:00:00.000Z", platform: "linux", nvidiaSmi: RTX_SMI, backends: [], localApi: result,
+  });
+  assert.match(report.summary.join("\n"), /Local API: not reachable/);
+  assert.match(report.summary.join("\n"), /did not depend on it/);
+});
+
+test("local API: a server that never answers is cut off by the short timeout", async () => {
+  const server = http.createServer(() => { /* never responds */ });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const started = Date.now();
+  try {
+    const result = await capture.checkLocalApi({ port, timeoutMs: 200 });
+    assert.equal(result.reachable, false);
+    assert.match(result.error, /no response within 200 ms/);
+    assert.ok(Date.now() - started < 5000, "the check must not wait for the server");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("local API: a non-JSON body is recorded as reachable but unreadable", async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200); res.end("<html>not json</html>"); });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const result = await capture.checkLocalApi({ port, timeoutMs: 1000 });
+    assert.equal(result.reachable, true);
+    assert.equal(result.selected, null);
+    assert.match(result.error, /not JSON/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("local API: the port must be a valid number, and the default comes from the app's own settings", () => {
+  assert.match(capture.parseArgs(["--api-port", "0"]).errors[0], /--api-port must be a port number/);
+  assert.match(capture.parseArgs(["--api-port", "abc"]).errors[0], /--api-port must be a port number/);
+  assert.deepEqual(capture.parseArgs(["--api-port", "1420"]).errors, []);
+  assert.equal(capture.parseArgs(["--api-port", "1420"]).apiPort, 1420);
+});
+
 // ── CLI (real child process; Linux and macOS only) ────────────────────────────────
 
 function writeFakeBackend(dir, name, script) {

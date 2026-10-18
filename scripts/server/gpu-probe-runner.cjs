@@ -26,7 +26,8 @@ function nvidiaSmiCommands(platform) {
     : ["nvidia-smi", "/usr/bin/nvidia-smi"];
 }
 
-// Returns { ok, devices, error, command? }. Never throws.
+// Returns { ok, devices, error, command?, attempts }. Never throws. `attempts` lists every query
+// that was run, in order, with its raw stdout and stderr, so a rejected field is visible in evidence.
 function queryNvidiaSmi({
   platform = process.platform,
   spawn = spawnSync,
@@ -34,8 +35,9 @@ function queryNvidiaSmi({
   queries = NVIDIA_SMI_QUERIES,
 } = {}) {
   if (platform === "darwin") {
-    return { ok: false, devices: [], error: "NVIDIA tools are not used on macOS." };
+    return { ok: false, devices: [], error: "NVIDIA tools are not used on macOS.", attempts: [] };
   }
+  const attempts = [];
   let lastError = "nvidia-smi was not found";
   for (const command of nvidiaSmiCommands(platform)) {
     if (path.isAbsolute(command) && !exists(command)) continue;
@@ -45,6 +47,14 @@ function queryNvidiaSmi({
         windowsHide: true,
         timeout: 5000,
         maxBuffer: 1024 * 1024,
+      });
+      attempts.push({
+        command,
+        query: fields,
+        exitCode: result.status === undefined ? null : result.status,
+        errorCode: result.error ? (result.error.code || "ERROR") : null,
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
       });
       if (result.error) {
         lastError = result.error.code === "ENOENT"
@@ -59,21 +69,28 @@ function queryNvidiaSmi({
         break;
       }
       const devices = parseNvidiaSmiCsv(result.stdout);
-      if (devices.length) return { ok: true, devices, error: null, command };
+      if (devices.length) return { ok: true, devices, error: null, command, attempts };
       lastError = "nvidia-smi reported no NVIDIA GPUs";
       break;
     }
   }
-  return { ok: false, devices: [], error: lastError };
+  return { ok: false, devices: [], error: lastError, attempts };
 }
 
-// Spawns one backend probe and returns { output, exitCode, errorCode }.
+// Spawns one backend probe. Returns { output, stdout, stderr, exitCode, errorCode, timedOut }.
+// `output` stays the combined text the classifiers read. stdout and stderr are kept apart for evidence.
 function runBackendProbeProcess(binaryPath, args, options) {
   const result = spawnSync(binaryPath, args, options);
+  const stdout = String(result.stdout || "");
+  const stderr = String(result.stderr || "");
+  const errorCode = result.error ? (result.error.code || "ERROR") : null;
   return {
-    output: `${result.stdout || ""}\n${result.stderr || ""}`,
+    output: `${stdout}\n${stderr}`,
+    stdout,
+    stderr,
     exitCode: result.status,
-    errorCode: result.error ? (result.error.code || "ERROR") : null,
+    errorCode,
+    timedOut: errorCode === "ETIMEDOUT",
   };
 }
 
