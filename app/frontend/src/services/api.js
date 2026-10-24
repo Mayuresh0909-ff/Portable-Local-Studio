@@ -952,7 +952,22 @@ export async function generateImage(prompt, negativePrompt, constraints, activeM
         height: payload.height,
       }),
     });
-    const data = await readJsonResponse(response, "The local server returned an invalid OpenVINO generation response.");
+    // A failed OpenVINO response keeps its message and category, like the image backend path below.
+    const openvinoText = await response.text().catch(() => "");
+    let data = null;
+    try { data = JSON.parse(openvinoText || "null"); } catch (_) { data = null; }
+    if (!response.ok || (data && data.ok === false)) {
+      const bodyMessage = data && typeof data.error === "string" && data.error ? data.error : `Generation failed (HTTP ${response.status})`;
+      throw createGenerationFailure({
+        status: response.status,
+        category: response.headers?.get?.("X-Studio-Error-Category") || data?.errorCategory || null,
+        message: bodyMessage,
+        raw: openvinoText || `HTTP ${response.status}`,
+      });
+    }
+    if (data === null || typeof data !== "object") {
+      throw new Error("The local server returned an invalid OpenVINO generation response.");
+    }
     const imgB64 = data?.data?.[0]?.b64_json;
     if (!imgB64) throw new Error("OpenVINO generation did not return an image.");
     const normalizedB64 = String(imgB64).replace(/^data:[^;]+;base64,/, "");

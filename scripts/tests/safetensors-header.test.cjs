@@ -80,7 +80,7 @@ test("a Flux-style file with no text encoder or VAE is ok, but the warning says 
   assert.match(warnings[0], /may need matching files/);
 });
 
-test("a language model is named as one, and the warning says image generation will not work", () => {
+test("a language model is named as one, and the warning says image generation is not expected to work", () => {
   const file = writeSafetensors("llm.safetensors", {
     "model.embed_tokens.weight": 64,
     "model.layers.0.self_attn.q_proj.weight": 64,
@@ -88,6 +88,8 @@ test("a language model is named as one, and the warning says image generation wi
   const report = st.inspectSafetensorsFile(file);
   assert.equal(report.family, "language-model");
   assert.match(st.warningsForReport(report).join("\n"), /not an image model/);
+  assert.match(st.warningsForReport(report).join("\n"), /not expected to work/);
+  assert.doesNotMatch(st.warningsForReport(report).join("\n"), /will not work/);
 });
 
 test("a file that ends before its tensor data is reported incomplete, with the missing byte count", () => {
@@ -357,4 +359,46 @@ test("source: the inspect route returns compatibility, and the generator shows i
   assert.match(generator, /role="note"[\s\S]*?Compatibility check \(does not block Generate\)/);
   // Generate stays enabled. Only prompt and model state disable it, as before.
   assert.match(generator, /disabled=\{isGenerating \|\| !prompt\.trim\(\) \|\| !activeModel\}/);
+});
+
+// ── Prefixed checkpoints (audit, this iteration) ────────────────────────────────
+
+test("a combined Flux checkpoint with the model.diffusion_model. prefix is high-confidence Flux", () => {
+  const file = writeSafetensors("flux-prefixed.safetensors", {
+    "model.diffusion_model.double_blocks.0.img_attn.qkv.weight": 64,
+    "model.diffusion_model.single_blocks.0.linear1.weight": 64,
+    "text_encoders.clip_l.transformer.text_model.embeddings.token_embedding.weight": 64,
+    "text_encoders.t5xxl.transformer.encoder.block.0.layer.0.SelfAttention.q.weight": 64,
+    "vae.decoder.up_blocks.0.resnets.0.conv1.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.status, "ok");
+  assert.equal(report.family, "flux");
+  assert.equal(report.confidence, "high");
+  assert.equal(report.components.textEncoder, true);
+  assert.equal(report.components.vae, true);
+  assert.deepEqual(st.warningsForReport(report), [], "a complete combined checkpoint has no warning");
+  assert.deepEqual(st.compatibilityForReport(report), [], "no launch warning when the text encoder and VAE are present");
+});
+
+test("a prefixed Flux file without a text encoder or VAE still gets the launch-mode compatibility warning", () => {
+  const file = writeSafetensors("flux-prefixed-only.safetensors", {
+    "model.diffusion_model.double_blocks.0.img_attn.qkv.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "flux");
+  const compatibility = st.compatibilityForReport(report);
+  assert.equal(compatibility.length, 1);
+  assert.equal(compatibility[0].setting, st.LAUNCH_SETTING);
+  assert.match(compatibility[0].message, /does not block Generate/);
+});
+
+test("a prefixed SD3 joint-block file stays a low-confidence 'likely' family and gets no compatibility warning", () => {
+  const file = writeSafetensors("sd3-prefixed.safetensors", {
+    "model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight": 64,
+  });
+  const report = st.inspectSafetensorsFile(file);
+  assert.equal(report.family, "sd3");
+  assert.equal(report.confidence, "low");
+  assert.deepEqual(st.compatibilityForReport(report), []);
 });

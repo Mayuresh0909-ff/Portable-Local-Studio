@@ -8,7 +8,7 @@
 // optional exit code. Checks run in a fixed order. The first match wins:
 //   1. out-of-memory        2. missing-runtime      3. unsupported-cpu
 //   4. device               5. model-file          6. model-context (cause not identified)
-//   7. unknown
+//   7. timeout              8. unknown
 // Out-of-memory comes first because VK_ERROR_OUT_OF_DEVICE_MEMORY would otherwise match the device
 // patterns. Missing DLLs and shared libraries come before device checks, because a missing library
 // is not a device fault.
@@ -20,6 +20,7 @@ const CATEGORY_LABELS = {
   device: "Device or driver failure",
   "model-file": "Model file incomplete or unreadable",
   "model-context": "Backend could not create the model context (cause not identified)",
+  timeout: "Timed out before the backend finished",
   unknown: "Unclassified backend failure",
 };
 
@@ -53,14 +54,23 @@ const DEVICE_PATTERNS = [
   /incompatible (driver|runtime|kernel)/i,
 ];
 
+// "Illegal instruction" is the shell's name for SIGILL. describeBackendSignalExit() writes the second form.
+const UNSUPPORTED_CPU_PATTERNS = [/illegal instruction/i, /\bSIGILL\b/];
+
 const MODEL_FILE_PATTERNS = [
   /read tensor data failed/i,
   /load tensors from file failed/i,
   /incomplete or corrupted/i,
   /invalid safetensors/i,
+  // The app's own pre-launch checks (getModelLoadIssue in serve.cjs) use these two messages.
+  /model file not found/i,
+  /is too small to be a complete image model/i,
 ];
 
 const MODEL_CONTEXT_PATTERNS = [/new_sd_ctx_t failed/i];
+
+// Only explicit timeout wording. Nothing here is inferred from silence or from a slow run.
+const TIMEOUT_PATTERNS = [/\btimed out\b/i, /\btimeout exceeded\b/i];
 
 // Windows exit codes, as reported by Node (unsigned values).
 const WINDOWS_EXIT_CPU = 0xC000001D;
@@ -98,6 +108,9 @@ function classifyBackendFailure({ output = "", exitCode = null, platform = "linu
   if (anyMatch(text, MISSING_RUNTIME_PATTERNS)) {
     return make("missing-runtime", firstLineMatching(text, MISSING_RUNTIME_PATTERNS));
   }
+  if (anyMatch(text, UNSUPPORTED_CPU_PATTERNS)) {
+    return make("unsupported-cpu", firstLineMatching(text, UNSUPPORTED_CPU_PATTERNS));
+  }
   if (anyMatch(text, DEVICE_PATTERNS)) {
     return make("device", firstLineMatching(text, DEVICE_PATTERNS));
   }
@@ -107,6 +120,9 @@ function classifyBackendFailure({ output = "", exitCode = null, platform = "linu
   if (anyMatch(text, MODEL_CONTEXT_PATTERNS)) {
     return make("model-context", firstLineMatching(text, MODEL_CONTEXT_PATTERNS));
   }
+  if (anyMatch(text, TIMEOUT_PATTERNS)) {
+    return make("timeout", firstLineMatching(text, TIMEOUT_PATTERNS));
+  }
   if (text.trim()) {
     return make("unknown", null);
   }
@@ -115,6 +131,18 @@ function classifyBackendFailure({ output = "", exitCode = null, platform = "linu
     return make("unknown", `exited with code ${exitCode}`);
   }
   return null;
+}
+
+// Text for a backend process that ended by a signal rather than an exit code. The app records it
+// only when the app did not stop the process itself (see serve.cjs). SIGILL is named as an illegal
+// instruction. Other signals are stated without a cause, because the output does not show one.
+function describeBackendSignalExit(signal) {
+  if (!signal) return null;
+  const name = String(signal);
+  if (name === "SIGILL") {
+    return "The backend process stopped with SIGILL (illegal instruction). The backend build may use a CPU instruction that this processor does not support.";
+  }
+  return `The backend process stopped by signal ${name} while running. The output does not say why.`;
 }
 
 // Header that carries the category of a failed image-generation response to the browser.
@@ -133,6 +161,7 @@ function generationErrorCategory({ body = "", backendError = "", platform = proc
 module.exports = {
   CATEGORY_LABELS,
   classifyBackendFailure,
+  describeBackendSignalExit,
   generationErrorCategory,
   ERROR_CATEGORY_HEADER,
 };

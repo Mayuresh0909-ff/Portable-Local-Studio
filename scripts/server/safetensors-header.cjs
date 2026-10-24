@@ -36,8 +36,10 @@ const FAMILY_LABELS = {
 // Tensor-name markers. `shared` markers are also used by other families, so they alone are weak.
 const MARKERS = [
   { id: "sdxlSecondEncoder", pattern: /^conditioner\.embedders\.1\./, prefix: "conditioner.embedders.1.", meaning: "SDXL second text encoder" },
-  { id: "sd3Joint", pattern: /^joint_blocks\./, prefix: "joint_blocks.", meaning: "SD3-style joint transformer blocks" },
-  { id: "fluxBlocks", pattern: /^(double|single)_blocks\./, prefix: "double_blocks. / single_blocks.", meaning: "Flux-style transformer blocks" },
+  // Some combined checkpoints store the transformer under "model.diffusion_model." (the prefix the
+  // diffusion component check already accepts), so the family markers accept that prefix too.
+  { id: "sd3Joint", pattern: /^(model\.diffusion_model\.)?joint_blocks\./, prefix: "joint_blocks.", meaning: "SD3-style joint transformer blocks" },
+  { id: "fluxBlocks", pattern: /^(model\.diffusion_model\.)?(double|single)_blocks\./, prefix: "double_blocks. / single_blocks.", meaning: "Flux-style transformer blocks" },
   { id: "sd1TextModel", pattern: /^cond_stage_model\.transformer\.text_model\./, prefix: "cond_stage_model.transformer.text_model.", meaning: "SD 1.x / 2.x CLIP text encoder" },
   { id: "unetInputBlocks", pattern: /^model\.diffusion_model\.input_blocks\./, prefix: "model.diffusion_model.input_blocks.", meaning: "UNet input blocks, shared by SD 1.x, 2.x and SDXL" },
 ];
@@ -134,7 +136,8 @@ function readSafetensorsHeader(filePath) {
     }
     fd = fs.openSync(filePath, "r");
     const lengthBuffer = Buffer.alloc(LENGTH_FIELD_BYTES);
-    fs.readSync(fd, lengthBuffer, 0, LENGTH_FIELD_BYTES, 0);
+    const lengthRead = fs.readSync(fd, lengthBuffer, 0, LENGTH_FIELD_BYTES, 0);
+    if (lengthRead !== LENGTH_FIELD_BYTES) return { ...base, reason: "the file could not be read for its header length" };
     const headerLength = lengthBuffer.readBigUInt64LE(0);
     if (headerLength === 0n) return { ...base, reason: "the header length is zero" };
     if (headerLength > BigInt(MAX_HEADER_BYTES)) {
@@ -151,7 +154,10 @@ function readSafetensorsHeader(filePath) {
       };
     }
     const headerBuffer = Buffer.alloc(headerBytes);
-    fs.readSync(fd, headerBuffer, 0, headerBytes, LENGTH_FIELD_BYTES);
+    const headerRead = fs.readSync(fd, headerBuffer, 0, headerBytes, LENGTH_FIELD_BYTES);
+    if (headerRead !== headerBytes) {
+      return { ...base, reason: "the file changed while its header was being read" };
+    }
     let parsed;
     try {
       parsed = JSON.parse(headerBuffer.toString("utf8"));
@@ -204,7 +210,7 @@ function warningsForReport(report) {
     return warnings;
   }
   if (report.family === "language-model") {
-    warnings.push("This looks like a language model, not an image model. Image generation will not work with it.");
+    warnings.push("This looks like a language model, not an image model, so image generation is not expected to work with it.");
   }
   if (report.components && report.components.diffusion && (!report.components.textEncoder || !report.components.vae)) {
     warnings.push("This file contains only some of the parts an image model needs (no text encoder or no VAE was found). It may need matching files to generate images.");

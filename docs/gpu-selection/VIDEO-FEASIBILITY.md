@@ -1,102 +1,127 @@
 # Video generation: feasibility (research only)
 
-Status: **PENDING**. This is a research note. No code, no UI, and no model download was added.
-Image generation is not changed by this document.
+Status: **NEEDS MORE EVIDENCE.** This is a research note. No video code, UI, model download, or backend
+download was added. Image generation is not changed by this document. Last updated 2026-10-24.
 
-## Question
+## Recommendation
 
-Could this app add local video generation on the target laptop (AMD Radeon 610M for display,
-NVIDIA GeForce RTX 5060 Laptop GPU for compute), using the backends it already bundles?
+**NEEDS MORE EVIDENCE.** Not GO: nothing has run video on the target GPU, and the 8 GB fit is not shown.
+Not NO-GO: the pinned backends contain the video code (source-level, below), and the memory question is
+measurable with one isolated run.
 
-## Short answer
+**What would change the decision**
 
-Plausible for a small text-to-video model at low resolution. It is not ready to build yet. Three things
-must be verified on the Windows machine first:
+- **To GO:** one clip completes on the RTX 5060 Laptop GPU with the Vulkan backend the app already uses, and
+  peak `memory.used` from `nvidia-smi` stays at or below the image baseline the user already saw succeed
+  (about 7,565 MiB out of 8,151 MiB). Time per clip must be acceptable to the user. Also settle the output
+  format (below) before any integration.
+- **To NO-GO:** the run fails with out-of-memory at 256×256, 5 frames, with the offload options on. Or the
+  smallest set of files cannot fit within the card's limit, even with the text encoder quantised and offloaded.
+- **Output format decision:** a browser-playable file needs either a WebM-enabled build or a converter
+  (ffmpeg, a new dependency). Without one of these, no integration should start.
 
-1. Whether the bundled stable-diffusion.cpp binaries can run video at all.
-2. How much VRAM the RTX 5060 Laptop GPU actually has, as reported by `nvidia-smi`.
-3. Whether a short clip completes in an acceptable time on that GPU.
+## Verified in this round (and how)
 
-## What the upstream project supports
-
-- stable-diffusion.cpp lists Wan2.1 and Wan2.2 (text-to-video, image-to-video, VACE), LTX-2.3,
-  HunyuanVideo 1.5 and others as supported models [1][2].
-- Video is run in a separate mode. The upstream example uses `sd-cli.exe -M vid_gen` with
-  `--video-frames`, `--diffusion-fa`, `--offload-to-cpu` and `--flow-shift` [3].
-- A Wan 2.1 text-to-video run needs several files: the diffusion model, a Wan VAE, and a UMT5-XXL text
-  encoder. Image-to-video also needs a CLIP vision file [3]. A standard VAE is VRAM-intensive, and a
-  tiny autoencoder (TAE) is available as a lighter alternative [4].
-
-## Hardware evidence (mixed quality)
-
-| Claim | Source type | Confidence |
+| Fact | How it was checked | Label |
 |---|---|---|
-| Wan 2.1 T2V-1.3B needs 8.19 GB VRAM. It makes a 5 s 480p clip on an RTX 4090 in about 4 minutes, without quantisation. | Upstream model card [5] | Official, but measured on an RTX 4090, not on an 8 GB laptop GPU |
-| The 1.3B model runs in about 4–6 GB with GGUF quantisation at 480p. | Third-party guides [6][7] | Community estimates; unverified here |
-| Wan 2.1 14B at 480p needs about 40–48 GB in FP8 on a datacentre GPU. | Hosting vendor blog [8] | Vendor estimate; not applicable to an 8 GB laptop |
+| The pinned Vulkan release `master-685-19bdfe2` targets commit `19bdfe22d255d5b4dff39d449318b9bc5ea2317f`, published 2026-06-08. | GitHub API release metadata | TESTED — AUTOMATED (metadata only) |
+| The pinned CUDA and CPU release `master-782-b290693` targets commit `b2906939774dc73453467215c80390404d0a2701`, published 2026-07-16. | GitHub API release metadata | TESTED — AUTOMATED (metadata only) |
+| At `19bdfe2`, the CLI accepts `--mode vid_gen` (help text: `[img_gen, vid_gen, upscale, convert, metadata]`). | Source at that commit | Source-verified; the binary was not run |
+| At `19bdfe2`, the server exposes `POST /sdcpp/v1/vid_gen`, job polling at `GET /sdcpp/v1/jobs/{id}`, cancel at `POST …/cancel`, and `GET /sdcpp/v1/capabilities`. The image-compatibility routes (`/sdapi/v1/txt2img`) are image-only. | Source at that commit | Source-verified; the binary was not run |
+| The same route family is present at `b290693` (CUDA and CPU builds). | Source at that commit | Source-verified |
+| The vid_gen request takes `width`, `height`, `seed`, `steps`, `video_frames`, `fps`, and `output_format`. The default `output_format` is `webm`. | Source, `routes_sdcpp.cpp` | Source-verified |
+| WebM is offered only when the build defines `SD_USE_WEBM`. AVI is always listed. A request for `webm` on a build without it is rejected. | Source, `runtime.cpp` and `routes_sdcpp.cpp` | Source-verified. The server build's own WebM setting was not confirmed. |
+| Upstream Wan documentation at `19bdfe2` lists the files for Wan 2.1 T2V 1.3B: the diffusion model, `wan_2.1_vae.safetensors`, and a UMT5-XXL text encoder (`--t5xxl`). The Wan VAE is noted as needing a lot of VRAM. | Upstream `docs/wan.md` | Source-verified |
+| The server README documents `--diffusion-model`, `--vae`, `--t5xxl`, `--offload-to-cpu`, `--diffusion-fa`, `--vae-tiling`, `--video-frames`, and `--flow-shift`. | Upstream `examples/server/README.md` | Source-verified |
+| Setup extracts only `sd-server.exe` from each zip, renamed to `sd-cuda.exe` or `sd-vulkan.exe`. The CLI (`sd-cli.exe`) is not installed by setup. Whether the zip also contains `sd-cli.exe` was not checked, because the zip was not downloaded. | `scripts/setup/setup.ps1` (lines 522, 685, 740) | Source-verified. The zip contents: UNVERIFIED. |
 
-The RTX 5060 Laptop GPU's VRAM depends on the laptop configuration. Read `memory.total` from
-`nvidia-smi` (or the evidence capture) on the target machine. Do not assume a figure.
+## File requirements and sizes (Wan 2.1 T2V 1.3B)
+
+Sizes come from the Hugging Face file listings of the Comfy-Org repackaged Wan files. Nothing was downloaded.
+
+| File | Role | Size (listing) |
+|---|---|---|
+| `wan2.1_t2v_1.3B_fp16.safetensors` | Diffusion model (`--diffusion-model`) | 2.84 GB |
+| `wan_2.1_vae.safetensors` | VAE (`--vae`) | 254 MB |
+| `umt5_xxl_fp16.safetensors` | Text encoder (`--t5xxl`), fp16 | 11.4 GB |
+| `umt5_xxl_fp8_e4m3fn_scaled.safetensors` | Text encoder (`--t5xxl`), fp8 | 6.74 GB |
+
+Total on disk: about **9.8 GB** with the fp8 text encoder, or about **14.5 GB** with fp16. Upstream also uses a
+Q8_0 GGUF text encoder in its example. Its size was not checked, so it is not counted here.
+
+Image-to-video also needs a CLIP vision file. This note covers text-to-video only.
+
+## Memory: what is measured and what is not
+
+| Figure | Source | Label |
+|---|---|---|
+| The image run on the RTX 5060 peaked at about 7,565 MiB of 8,151 MiB (SDXL, `juggernautXL_ragnarok.safetensors`). | User-supplied Windows observation | USER-REPORTED (TESTED — WINDOWS as reported) |
+| Wan 2.1 T2V-1.3B "requires only 8.19 GB VRAM". A 5 s 480p clip takes about 4 minutes on an RTX 4090. | Wan2.1 README (`Wan-Video/Wan2.1`) | Upstream, but for the PyTorch reference implementation, not stable-diffusion.cpp. The 4090 is not an 8 GB card. Not applicable as a measurement for this app. |
+| Peak VRAM of the stable-diffusion.cpp Wan run on the RTX 5060 | Not measured | PENDING |
+| Time per clip on the RTX 5060 | Not measured | PENDING |
+
+Two points follow from the table. First, the 8.19 GB figure is close to this card's 8,151 MiB total. The README
+does not say whether it includes the text encoder, and it comes from a different implementation, so it cannot be
+read as a fit for sd.cpp. Second, the SDXL run
+used 7,565 MiB of 8,151 MiB, so there is little margin for a second large model on this card. Expect offload,
+a quantised text encoder, and VAE tiling to be necessary. That is an expectation, not a measurement.
 
 ## Fit with this repository
 
-- **Pinned backends.** The CUDA and CPU Windows builds are `master-782-b290693` (`setup.ps1` lines 212–213,
-  and the release is dated 16 July 2026 [9]). The Vulkan build is `master-685-19bdfe2` (`setup.ps1`
-  line 215). The Vulkan build's date was not checked.
-- **Unverified.** Whether `vid_gen` exists in these builds was not checked. The app runs `sd-cuda.exe`
-  and `sd-vulkan.exe` with an HTTP image API. Whether those binaries expose video through that API
-  was not checked either. Check locally with `sd-cli.exe --help` and the server's documentation. Do not
-  assume the answer.
-- **Image API.** Generation is proxied to the backend's image endpoint and expects an image back
-  (`serve.cjs`, `proxyImageBackendRequest`; `api.js`, `generateImage`). Video needs its own endpoint or
-  a subprocess mode, a frame or MP4 output format, storage under `app/outputs`, and a player in the UI.
-- **Model records.** The app downloads and lists one file per model (`ModelManager`, `/api/models`).
-  Wan needs three or four coordinated files. Supporting it needs multi-file model records, or a
-  separate "video model" profile that points at each file.
-- **Errors.** The current error text for diffusion-only SDXL GGUF files already says that matching VAE
-  and text-encoder files are needed (`describeBackendError`). The same problem would apply to video.
-- **GPU selection.** The device probes in `gpu-selection.cjs` are for image generation. A video run
-  would need its own probe, timeout, and memory checks. The 5 s probe timeout is not a video timeout.
+- **Image API is not reused.** Video uses the asynchronous `/sdcpp/v1/vid_gen` route and job polling. It is not
+  the `/sdapi/v1/txt2img` route the app proxies (`serve.cjs`, `proxyImageBackendRequest`). Integration needs a
+  separate job client, not a mode switch.
+- **Output.** The request default is `webm`, which a build without `SD_USE_WEBM` rejects. AVI is always supported,
+  so a client must ask for `avi` explicitly unless WebM is confirmed. Browsers do not reliably play AVI, so the
+  player path depends on the output decision above.
+- **Model records.** The app lists one file per model (`ModelManager`, `/api/models`). Wan needs three files
+  from separate folders, so a multi-file "video model" profile would be needed.
+- **Errors.** `describeBackendError` already says that diffusion-only GGUF files need matching VAE and text-encoder
+  files. The same wording would apply to Wan.
+- **GPU selection.** The probes in `gpu-selection.cjs` cover image generation only. A video run needs its own
+  probe, timeout, and memory check. The current 5 s probe timeout is not a video timeout.
 
-## Options
+## Proposed isolated spike (not run; needs user approval for the download)
 
-| Option | What it changes | Risk | Recommendation |
-|---|---|---|---|
-| A. Keep video out of scope | Nothing | None | Default until the Windows spike succeeds |
-| B. Separate spike: run `sd-cli vid_gen` as a child process, outside the image API | A script and output folder, no change to image generation | Low. Isolated, and easy to remove | Do this first, after GPU validation |
-| C. Add video to the server's HTTP API and UI | Routes, model profiles, output format, UI | High. Touches the generation path | Only after B shows it works |
+The spike uses the server binary the install already has. It runs outside `app/backend`, `app/models`, and the app's
+config. No PLS code changes.
 
-## Proposed Windows spike (for the user to run; not run here)
+1. Confirm the binary has the route: `GET /sdcpp/v1/capabilities` on the spike server must list `vid_gen`.
+   If it does not, stop.
+2. Download only the 1.3B fp16 diffusion model, the Wan 2.1 VAE, and the fp8 text encoder, into a separate
+   folder, after the user approves the size (about 9.8 GB).
+3. Start the existing Vulkan server (`sd-vulkan.exe`) on a spare port with `--diffusion-model`, `--vae`, `--t5xxl`,
+   `--offload-to-cpu`, and `--vae-tiling`. Do not start the app's backend at the same time.
+4. Submit one `vid_gen` job: 256×256, 5 frames, `output_format: "avi"`. Poll the job. Note the status and error text.
+5. While it runs, record `nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv -l 1`.
+6. Pass: the job completes, the AVI opens in a standard player, and peak `memory.used` is at or below 7,565 MiB.
+   Record the time. Fail: any error. Record the exact line and the peak.
 
-1. Confirm `sd-cli.exe --help` lists `vid_gen`. If it does not, stop. Option B is off the table with
-   this build.
-2. Download the Wan 2.1 T2V-1.3B files only if you approve the download size. Do not put them in
-   `app/models` until the spike has a plan for them.
-3. Run one clip of 5 frames at 480×480 (or lower). Use the RTX 5060 device through the same CUDA
-   path the image backend uses.
-4. While it runs, record `nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv -l 1`.
-5. Pass: a clip completes, the output file opens, and peak VRAM fits in the GPU's `memory.total` with
-   room to spare. Record the time. Fail: any error. Record the exact line.
-
-Nothing in this spike shows that a video is correct, or that the app can present it. It shows only
-whether the backend can run video on this machine.
+The spike shows only whether this backend can run video on this machine. It does not show that the video is
+correct, that the output can be played in the app, or that the app's memory handling is safe.
 
 ## Known unknowns
 
-- The Vulkan build's support for Wan (the CUDA build is the more likely path on the RTX 5060).
-- Whether the bundled `sd-server` binary exposes video at all.
-- Real generation time on the RTX 5060 Laptop GPU.
+- Whether the release zips contain `sd-cli.exe`, and whether the server build has WebM.
+- Whether the Vulkan build performs as the CUDA build does for video. The RTX 5060 image run used Vulkan.
+- Whether `umt5_xxl` loads and offloads correctly with `--offload-to-cpu` on this card.
+- Real peak VRAM and time on the RTX 5060 Laptop GPU.
 - How the Radeon 610M affects video memory and display use during a run.
+- Laptop system RAM: the fp16 text encoder is 11.4 GB.
 
 ## Sources
 
-[1] https://github.com/leejet/stable-diffusion.cpp (feature list: Wan2.1/2.2, LTX-2.3, HunyuanVideo 1.5)
-[2] https://deepwiki.com/leejet/stable-diffusion.cpp/5.6-video-generation (T2V, I2V, VACE; VAE and TAE requirements)
-[3] https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/wan.md (`-M vid_gen` examples and required files)
-[4] https://deepwiki.com/leejet/stable-diffusion.cpp/6.1.6-wan-video-models (VAE versus TAE)
-[5] https://github.com/Wan-Video/Wan2.1 (8.19 GB VRAM for the 1.3B model; about 4 minutes for a 5 s 480p clip on an RTX 4090)
-[6] https://willitrunai.com/blog/wan-2-2-vram-requirements (GGUF estimates; community)
-[7] https://runaihome.com/blog/wan-video-local-ai-gpu-guide-2026/ (8 GB tier guidance; community)
-[8] https://www.spheron.network/blog/deploy-wan-2-1-ai-video-generation-gpu-setup/ (datacentre VRAM figures; vendor)
-[9] https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-782-b290693 (release date and commit)
-Repository: `scripts/setup/setup.ps1` lines 211–215 (pinned backend builds); `scripts/server/serve.cjs` (`proxyImageBackendRequest`, `describeBackendError`).
+Upstream sources are at the pinned commits, not the moving `master` branch.
+
+[1] `docs/wan.md` at `19bdfe22d255d5b4dff39d449318b9bc5ea2317f`: https://github.com/leejet/stable-diffusion.cpp/blob/19bdfe22d255d5b4dff39d449318b9bc5ea2317f/docs/wan.md (file list, `-M vid_gen` examples, VAE VRAM note)
+[2] `examples/cli/main.cpp` at `19bdfe22…`: https://github.com/leejet/stable-diffusion.cpp/blob/19bdfe22d255d5b4dff39d449318b9bc5ea2317f/examples/cli/main.cpp (`--mode vid_gen`)
+[3] `examples/server/routes_sdcpp.cpp` at `19bdfe22…`: https://github.com/leejet/stable-diffusion.cpp/blob/19bdfe22d255d5b4dff39d449318b9bc5ea2317f/examples/server/routes_sdcpp.cpp (`/sdcpp/v1/vid_gen`, jobs, capabilities)
+[4] `examples/server/runtime.cpp` at `19bdfe22…`: https://github.com/leejet/stable-diffusion.cpp/blob/19bdfe22d255d5b4dff39d449318b9bc5ea2317f/examples/server/runtime.cpp (output formats, `SD_USE_WEBM`)
+[5] `examples/server/README.md` at `19bdfe22…`: https://github.com/leejet/stable-diffusion.cpp/blob/19bdfe22d255d5b4dff39d449318b9bc5ea2317f/examples/server/README.md (server flags)
+[6] Release `master-685-19bdfe2` (API metadata, published 2026-06-08): https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-685-19bdfe2
+[7] Release `master-782-b290693` (API metadata, published 2026-07-16): https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-782-b290693
+[8] Wan2.1 README (8.19 GB; RTX 4090 timing; PyTorch reference): https://github.com/Wan-Video/Wan2.1
+[9] Hugging Face file listings, Comfy-Org repackaged Wan 2.1 (sizes): https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files (diffusion_models, vae, text_encoders)
+[10] Secondary sources cited in the earlier version of this note (community guides and vendor blogs, including the 40–48 GB datacentre figure) are not used for any decision here.
+
+Repository references: `scripts/setup/setup.ps1` (pins at lines 212–215; extraction of `sd-server.exe` at lines 522, 685, and 740).

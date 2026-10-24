@@ -149,15 +149,20 @@ async function loadFailureModule() {
 }
 
 test("frontend: each category has its own title and action, and an unknown category falls back to unknown", async () => {
-  const { describeGenerationFailure } = await loadFailureModule();
+  const { describeGenerationFailure, GENERATION_FAILURE_CATEGORIES } = await loadFailureModule();
   const titles = new Set();
-  for (const category of ["out-of-memory", "device", "missing-runtime", "model-file", "unsupported-cpu", "model-context", "unknown"]) {
+  for (const category of GENERATION_FAILURE_CATEGORIES) {
     const described = describeGenerationFailure({ category, message: "m", raw: "r" });
     assert.equal(described.category, category);
     assert.ok(described.title && described.action, `${category} has text`);
     titles.add(described.title);
   }
-  assert.equal(titles.size, 7, "each category has a distinct title");
+  assert.deepEqual(
+    [...GENERATION_FAILURE_CATEGORIES].sort(),
+    ["device", "missing-runtime", "model-context", "model-file", "out-of-memory", "timeout", "unknown", "unsupported-cpu"],
+    "the category list is the eight known categories",
+  );
+  assert.equal(titles.size, GENERATION_FAILURE_CATEGORIES.length, "each category has a distinct title");
   assert.equal(describeGenerationFailure({ category: "made-up" }).category, "unknown");
   assert.equal(describeGenerationFailure({}).category, "unknown");
 });
@@ -271,4 +276,111 @@ test("source: the generator shows the category text and a sanitized diagnostic, 
   const api = read("app/frontend/src/services/api.js");
   assert.match(api, /throw createGenerationFailure\(\{/);
   assert.doesNotMatch(api.slice(api.indexOf("export async function generateImage"), api.indexOf("export async function importModelFile")), /retry|setTimeout\(\(\) => generateImage/i);
+});
+
+// ── Timeouts, OpenVINO failures, and signal exits (this iteration) ───────────────
+
+const TIMEOUT_BODY = JSON.stringify({ error: { message: "OpenVINO NPU 512x512 compile timed out after 6 minutes." } });
+
+test("proxy: a timed-out generation body is categorised as timeout, and the body is unchanged", { timeout: 60000 }, async () => {
+  const { serve, backend } = await withProxy(500, TIMEOUT_BODY);
+  try {
+    const res = await post(serve.port);
+    assert.equal(res.text, TIMEOUT_BODY);
+    assert.equal(res.headers[ERROR_CATEGORY_HEADER.toLowerCase()], "timeout");
+  } finally {
+    await serve.stop();
+    await backend.close();
+  }
+});
+
+test("frontend: the timeout text says nothing was changed and no other device was tried, and does not claim a model problem", async () => {
+  const { describeGenerationFailure } = await loadFailureModule();
+  const described = describeGenerationFailure({ category: "timeout", message: "m", raw: "r" });
+  assert.equal(described.title, "Generation timed out");
+  assert.match(described.action, /Nothing was changed automatically/);
+  assert.match(described.action, /no other device was tried/);
+  assert.doesNotMatch(described.action, /model file|incompatib|driver/i);
+});
+
+test("frontend: the model-file title covers both a missing file and an unreadable one", async () => {
+  const { describeGenerationFailure } = await loadFailureModule();
+  const described = describeGenerationFailure({ category: "model-file" });
+  assert.match(described.title, /missing or unreadable/);
+  assert.match(described.action, /find or read the model file/);
+});
+
+async function runOpenVinoWith(response) {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const calls = [];
+  global.window = { location: { protocol: "http:" } };
+  global.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return response;
+  };
+  try {
+    const { generateImage } = await import(`${pathToFileURL(path.join(root, "app/frontend/src/services/api.js")).href}?openvino-failure-test`);
+    let thrown = null;
+    let result = null;
+    try {
+      result = await generateImage("a red cube", "", { width: 512, height: 512, steps: 4, cfgScale: 7, seed: 1, sampler: "euler_a", backendType: "openvino-npu" }, "model.safetensors", null);
+    } catch (error) {
+      thrown = error;
+    }
+    return { thrown, result, calls };
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+}
+
+test("api: an OpenVINO failure response keeps its message and category, and is not retried", async () => {
+  const body = JSON.stringify({ ok: false, error: "OpenVINO NPU 512x512 compile timed out after 6 minutes.", errorCategory: "timeout" });
+  const { thrown, calls } = await runOpenVinoWith(fakeResponse({ status: 500, body }));
+  assert.equal(calls.length, 1, "no retry");
+  assert.equal(calls[0].url, "/api/openvino-generate");
+  assert.ok(thrown && thrown.generationFailure, "a generation failure is thrown, not a generic error");
+  assert.equal(thrown.category, "timeout");
+  assert.match(thrown.message, /compile timed out/);
+  assert.equal(thrown.raw, body);
+});
+
+test("api: an OpenVINO success still returns the image (regression for the changed response handling)", async () => {
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24)]).toString("base64");
+  const body = JSON.stringify({ ok: true, data: [{ b64_json: png, seed: 7 }], duration_sec: 2.5 });
+  const { thrown, result } = await runOpenVinoWith(fakeResponse({ status: 200, body }));
+  assert.equal(thrown, null);
+  assert.match(result.image, /^data:image\/png;base64,/);
+  assert.equal(result.seed, 7);
+  assert.equal(result.duration_sec, 2.5);
+});
+
+test("serve: the OpenVINO generate route returns an error category with its message when no worker is ready", { timeout: 60000 }, async () => {
+  const serve = await harness.startServe({ label: "openvino-route" });
+  try {
+    const payload = JSON.stringify({ prompt: "a red cube", width: 512, height: 512, steps: 4 });
+    const res = await harness.request(serve.port, {
+      method: "POST",
+      urlPath: "/api/openvino-generate",
+      body: payload,
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
+    });
+    assert.equal(res.status, 500);
+    const data = JSON.parse(res.text);
+    assert.equal(data.ok, false);
+    assert.match(data.error, /OpenVINO NPU worker is not ready/);
+    assert.equal(data.errorCategory, "unknown", "the message names no cause, so the category is unknown");
+  } finally {
+    await serve.stop();
+  }
+});
+
+test("source: a backend stopped by a signal is recorded, unless the app stopped it on purpose", () => {
+  // SOURCE CHECK. The exit path needs a real backend process, which these tests do not start. The
+  // text it writes is tested as behaviour in failure-classification.test.cjs.
+  const server = read("scripts/server/serve.cjs");
+  assert.match(server, /const expectedBackendExits = new WeakSet\(\);/);
+  assert.match(server, /expectedBackendExits\.add\(proc\);\s*\n\s*try \{ proc\.kill\("SIGTERM"\)/, "unload marks the process as expected before it sends SIGTERM");
+  assert.match(server, /else if \(code === null && signal && !expectedBackendExits\.has\(proc\) && !backendError\) \{\s*\n\s*\/\/[^\n]*\n\s*backendError = describeBackendSignalExit\(signal\);/);
 });

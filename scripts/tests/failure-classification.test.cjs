@@ -11,6 +11,7 @@ const test = require("node:test");
 
 const root = path.resolve(__dirname, "..", "..");
 const { classifyBackendFailure } = require(path.join(root, "scripts", "server", "failure-classification.cjs"));
+const fc = require(path.join(root, "scripts", "server", "failure-classification.cjs"));
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), "utf8");
 
 test("no error text and a zero exit code is not classified; a nonzero exit with no text is unknown", () => {
@@ -95,4 +96,48 @@ test("the server attaches the category to both status responses, and the existin
   assert.equal(statusCount, 2, "both status outputs carry the category");
   // The error text itself is still returned unchanged.
   assert.match(server, /error: backendError,/);
+});
+
+// ── Signals, the app's own model-file messages, and timeouts (this iteration) ────
+
+test("signal exits: SIGILL is named as an illegal instruction and classified unsupported-cpu", () => {
+  const text = fc.describeBackendSignalExit("SIGILL");
+  assert.match(text, /SIGILL \(illegal instruction\)/);
+  assert.equal(fc.classifyBackendFailure({ output: text, platform: "linux" }).category, "unsupported-cpu");
+});
+
+test("signal exits: another signal is unknown, and its text says the output does not show why", () => {
+  const text = fc.describeBackendSignalExit("SIGSEGV");
+  assert.match(text, /stopped by signal SIGSEGV/);
+  assert.match(text, /does not say why/);
+  const found = fc.classifyBackendFailure({ output: text, platform: "linux" });
+  assert.equal(found.category, "unknown", "a signal is not guessed into a cause");
+});
+
+test("signal exits: no signal gives no text, so nothing is recorded", () => {
+  assert.equal(fc.describeBackendSignalExit(null), null);
+  assert.equal(fc.describeBackendSignalExit(undefined), null);
+});
+
+test("the app's own pre-launch model messages are model-file", () => {
+  assert.equal(fc.classifyBackendFailure({ output: "Model file not found: missing.safetensors", platform: "linux" }).category, "model-file");
+  assert.equal(
+    fc.classifyBackendFailure({ output: "tiny.safetensors is too small to be a complete image model (12 MB). Delete it and download/import it again.", platform: "linux" }).category,
+    "model-file",
+  );
+});
+
+test("timeouts: explicit timed-out wording is timeout", () => {
+  const found = fc.classifyBackendFailure({ output: "OpenVINO NPU 512x512 compile timed out after 6 minutes.", platform: "linux" });
+  assert.equal(found.category, "timeout");
+  assert.match(found.detail, /timed out/);
+  assert.equal(fc.CATEGORY_LABELS.timeout, "Timed out before the backend finished");
+});
+
+test("timeouts: a device error that also says timed out stays device (the specific cause comes first)", () => {
+  assert.equal(fc.classifyBackendFailure({ output: "CUDA error: unspecified launch failure; wait timed out", platform: "linux" }).category, "device");
+});
+
+test("timeouts: a bare word 'timeout' in unrelated text is not a timeout", () => {
+  assert.equal(fc.classifyBackendFailure({ output: "vkWaitForFences: timeout on queue 2", platform: "linux" }).category, "unknown");
 });

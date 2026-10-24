@@ -12,6 +12,7 @@ export const GENERATION_FAILURE_CATEGORIES = [
   "model-file",
   "unsupported-cpu",
   "model-context",
+  "timeout",
   "unknown",
 ];
 
@@ -30,8 +31,8 @@ const CATEGORY_TEXT = {
     action: "The backend could not load a file it needs at runtime, such as a DLL. Run the setup script again, then retry.",
   },
   "model-file": {
-    title: "Model file could not be read",
-    action: "The backend could not read the model file. Check the file in Model Manager, or import it again.",
+    title: "Model file missing or unreadable",
+    action: "The backend could not find or read the model file, or the file is incomplete. Check the file in Model Manager, or import it again.",
   },
   "unsupported-cpu": {
     title: "CPU feature not supported",
@@ -40,6 +41,10 @@ const CATEGORY_TEXT = {
   "model-context": {
     title: "Backend could not set up the model",
     action: "The backend failed while creating the model context. Its output does not say why, so no cause is claimed. Check the diagnostic below.",
+  },
+  timeout: {
+    title: "Generation timed out",
+    action: "The backend did not finish within the app's time limit. Nothing was changed automatically and no other device was tried. Try a smaller size or fewer steps, then start the generation again yourself.",
   },
   unknown: {
     title: "Generation failed",

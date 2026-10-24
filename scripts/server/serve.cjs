@@ -39,7 +39,7 @@ const {
 const { queryNvidiaSmi, runBackendProbeProcess } = require("./gpu-probe-runner.cjs");
 const { createBackendPaths } = require("./backend-paths.cjs");
 const { inspectSafetensorsFile, warningsForReport, compatibilityForReport, safeSafetensorsPath } = require("./safetensors-header.cjs");
-const { classifyBackendFailure, generationErrorCategory, ERROR_CATEGORY_HEADER } = require("./failure-classification.cjs");
+const { classifyBackendFailure, describeBackendSignalExit, generationErrorCategory, ERROR_CATEGORY_HEADER } = require("./failure-classification.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -256,6 +256,9 @@ let backendProc  = null;
 let backendProcSeq = 0;
 let backendReady = false;
 let backendError = null;
+// Backend processes the app is stopping on purpose (unload). Their signal exit is expected and is not
+// recorded as a backend error.
+const expectedBackendExits = new WeakSet();
 let openvinoProc = null;
 let openvinoReady = false;
 let openvinoError = null;
@@ -4312,6 +4315,7 @@ function killBackend() {
     }
     backendUnloadState = { active: true, phase: "Stopping backend process...", progress: 10 };
     backendReady = false;
+    expectedBackendExits.add(proc);
     try { proc.kill("SIGTERM"); } catch (_) {}
     backendUnloadState = { active: true, phase: "Waiting for process exit...", progress: 50 };
     setTimeout(() => {
@@ -5076,6 +5080,9 @@ async function startBackend(settings = {}) {
       if (!backendError) {
         backendError = describeBackendExitCode(code, currentSettings.backendBinary || BACKEND_PATH);
       }
+    } else if (code === null && signal && !expectedBackendExits.has(proc) && !backendError) {
+      // Killed by a signal (for example SIGILL on an unsupported CPU). Without this the failure left no record.
+      backendError = describeBackendSignalExit(signal);
     }
     backendLoadState.active = false;
     generationState.active = false;
@@ -7343,7 +7350,10 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     try {
       return json(res, 200, await generateWithOpenVino(body));
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      const message = err.message || String(err);
+      // Same classifier as the image proxy, so an OpenVINO failure gets a category too.
+      const errorCategory = generationErrorCategory({ body: message, platform: osPlatform });
+      return json(res, 500, { ok: false, error: message, errorCategory });
     }
   }
 
