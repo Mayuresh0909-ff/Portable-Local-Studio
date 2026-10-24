@@ -7,7 +7,7 @@ import Settings from "./components/Settings";
 import TextChat from "./components/TextChat";
 import SpeechTranscriber from "./components/SpeechTranscriber";
 import TextToSpeech from "./components/TextToSpeech";
-import { cleanupCandidates, formatBytes, getCleanupCandidates, getDiagnostics, getHardwareSpecs, getHealth, getTelemetry, getBackendOptions, getBackendStatus, listGeneratedOutputs, listLlmConversations, saveLlmConversation, deleteLlmConversation, listSpeechTranscriptions, deleteSpeechTranscription, listTtsOutputs, deleteTtsOutput, stopServer } from "./services/api";
+import { cleanupCandidates, formatBytes, getCleanupCandidates, getDiagnostics, getHardwareSpecs, getHealth, getTelemetry, getGenerationProgress, getBackendOptions, getBackendStatus, listGeneratedOutputs, listLlmConversations, saveLlmConversation, deleteLlmConversation, listSpeechTranscriptions, deleteSpeechTranscription, listTtsOutputs, deleteTtsOutput, stopServer } from "./services/api";
 import "./App.css";
 
 function App() {
@@ -69,6 +69,7 @@ function App() {
   const [cleanupItems, setCleanupItems] = useState([]);
   const [isReadinessBusy, setIsReadinessBusy] = useState(false);
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const [isRefreshingSpecs, setIsRefreshingSpecs] = useState(false);
 
   // Gallery History
   const [generatedImages, setGeneratedImages] = useState([]);
@@ -94,6 +95,11 @@ function App() {
     gpu_name: "Detecting...",
     vram_used_gb: 0,
     vram_total_gb: 0,
+  });
+  const [imageBackendStatus, setImageBackendStatus] = useState({
+    backendMode: "",
+    backendDevice: "",
+    active: false,
   });
 
   // Default Image Constraints
@@ -470,6 +476,30 @@ function App() {
     loadSpecs();
   }, []);
 
+  const refreshHardwareSpecs = useCallback(async () => {
+    if (serverRunning || isLlmLoaded || isRefreshingSpecs) return;
+    setIsRefreshingSpecs(true);
+    try {
+      const hardware = await getHardwareSpecs({ refresh: true });
+      const [backendInfo, liveTelemetry] = await Promise.all([
+        getBackendOptions(),
+        getTelemetry(),
+      ]);
+      setSpecs(hardware);
+      setBackendOptions(backendInfo);
+      setTelemetry(liveTelemetry);
+    } catch (err) {
+      console.error("Failed to refresh hardware detection:", err);
+      await showAlert({
+        title: "Hardware Refresh Failed",
+        message: err.message || String(err),
+        danger: true,
+      });
+    } finally {
+      setIsRefreshingSpecs(false);
+    }
+  }, [serverRunning, isLlmLoaded, isRefreshingSpecs, showAlert]);
+
   const refreshReadiness = useCallback(async () => {
     setIsReadinessBusy(true);
     try {
@@ -588,7 +618,10 @@ function App() {
   useEffect(() => {
     async function updateTelemetry() {
       try {
-        const stats = await getTelemetry();
+        const [stats, imageProgress] = await Promise.all([
+          getTelemetry(),
+          getGenerationProgress().catch(() => null),
+        ]);
         setTelemetry((prev) => (
           prev.cpu_usage === stats.cpu_usage &&
           prev.ram_used_gb === stats.ram_used_gb &&
@@ -599,6 +632,20 @@ function App() {
             ? prev
             : stats
         ));
+        if (imageProgress) {
+          const nextImageBackendStatus = {
+            backendMode: imageProgress.backendMode || "",
+            backendDevice: imageProgress.backendDevice || "",
+            active: Boolean(imageProgress.active),
+          };
+          setImageBackendStatus((prev) => (
+            prev.backendMode === nextImageBackendStatus.backendMode &&
+            prev.backendDevice === nextImageBackendStatus.backendDevice &&
+            prev.active === nextImageBackendStatus.active
+              ? prev
+              : nextImageBackendStatus
+          ));
+        }
       } catch (err) {
         // Telemetry errors ignored
       }
@@ -683,6 +730,9 @@ function App() {
       activeTab={activeTab}
       setActiveTab={setActiveTab}
       specs={specs}
+      onRefreshSpecs={refreshHardwareSpecs}
+      isRefreshingSpecs={isRefreshingSpecs}
+      canRefreshSpecs={!serverRunning && !isLlmLoaded}
       conversations={conversations}
       activeConversationId={activeConversationId}
       setActiveConversationId={setActiveConversationId}
@@ -702,7 +752,7 @@ function App() {
       setShowTtsHistory={setShowTtsHistory}
       onDeleteTtsOutput={handleDeleteTtsOutput}
     />
-  ), [sidebarVisible, activeTab, specs, conversations, activeConversationId, showHistory, handleDeleteConversation, speechTranscriptions, selectedSpeechTranscript, showSpeechHistory, handleDeleteSpeechTranscription, ttsOutputs, selectedTtsOutput, showTtsHistory, handleDeleteTtsOutput]);
+  ), [sidebarVisible, activeTab, specs, refreshHardwareSpecs, isRefreshingSpecs, serverRunning, isLlmLoaded, conversations, activeConversationId, showHistory, handleDeleteConversation, speechTranscriptions, selectedSpeechTranscript, showSpeechHistory, handleDeleteSpeechTranscription, ttsOutputs, selectedTtsOutput, showTtsHistory, handleDeleteTtsOutput]);
 
   const handleStopServer = useCallback(async () => {
     if (!serverRunning || isStoppingServer) return;
@@ -729,6 +779,7 @@ function App() {
         {/* Top telemetry specs chips bar */}
         <TopStatusBar
           telemetry={telemetry}
+          imageBackendStatus={imageBackendStatus}
           serverRunning={serverRunning}
           activeModel={activeModel}
           isLlmLoaded={isLlmLoaded}

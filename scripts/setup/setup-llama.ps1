@@ -30,6 +30,28 @@ function Format-Speed {
     return "{0:N0} KB/s" -f ($bps / 1KB)
 }
 
+# Pinned SHA-256 digests for ggml-org/llama.cpp tag b9668 (GitHub release-asset metadata,
+# api.github.com/repos/ggml-org/llama.cpp/releases/tags/b9668). Archives are verified before extraction.
+# A -Release value without an entry here makes the install fail closed instead of trusting an unverified download.
+$llamaSha256ByAsset = @{
+    "llama-b9668-bin-win-vulkan-x64.zip"     = "76bc136cffe2d340726d629d7f00563c30c6fd27990fab215e563c0bd30baddd"
+    "llama-b9668-bin-win-cpu-x64.zip"        = "47e365fcaa33c875330479411d372f87ce992df791562aecb4f9c1bae869d943"
+    "llama-b9668-bin-win-cuda-12.4-x64.zip"  = "086d29fe3f73c11c45cfebac8fb4df80bcfbda87c8a242ffcb8e7cf231f358c9"
+    "cudart-llama-bin-win-cuda-12.4-x64.zip" = "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+    "llama-b9668-bin-win-sycl-x64.zip"       = "af25307c5ed82aed100045134616b7450fee242542672d00f538581d6582f20e"
+}
+
+function Assert-FileSha256 {
+    param([string]$Path, [string]$ExpectedSha256, [string]$Label)
+    Write-Host "   >>  Verifying SHA-256: $Label"
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 mismatch for $Label. Expected $ExpectedSha256 but got $actual. The download was deleted and was not extracted or run."
+    }
+    Write-Host "   OK  SHA-256 verified: $Label"
+}
+
 function Download-File {
     param([string]$Url, [string]$DestPath, [string]$Label)
     
@@ -123,6 +145,10 @@ function Install-LlamaArchive {
         return
     }
 
+    if (-not $llamaSha256ByAsset.ContainsKey($AssetName)) {
+        throw "No pinned SHA-256 for $AssetName (release $Release). Refusing to download an unverified llama.cpp archive."
+    }
+
     $archive = Join-Path $toolsDir $AssetName
     $extract = Join-Path $toolsDir "llama-$Variant-extract"
     $url = "https://github.com/ggml-org/llama.cpp/releases/download/$Release/$AssetName"
@@ -131,6 +157,7 @@ function Install-LlamaArchive {
     Remove-Item $archive, $extract -Recurse -Force -ErrorAction SilentlyContinue
 
     Download-File -Url $url -DestPath $archive -Label "llama.cpp $Variant backend ($Release)"
+    Assert-FileSha256 -Path $archive -ExpectedSha256 $llamaSha256ByAsset[$AssetName] -Label $AssetName
 
     Write-Host "   >>  Extracting llama.cpp $Variant backend..."
     Expand-Archive -Path $archive -DestinationPath $extract -Force
@@ -149,6 +176,7 @@ function Install-LlamaArchive {
         Remove-Item $cudartArchive, $cudartExtract -Recurse -Force -ErrorAction SilentlyContinue
 
         Download-File -Url $cudartUrl -DestPath $cudartArchive -Label "llama.cpp CUDA runtime library ($Release)"
+        Assert-FileSha256 -Path $cudartArchive -ExpectedSha256 $llamaSha256ByAsset[$cudartAsset] -Label $cudartAsset
 
         Write-Host "   >>  Extracting CUDA runtime libraries..."
         Expand-Archive -Path $cudartArchive -DestinationPath $cudartExtract -Force

@@ -45,10 +45,7 @@ if not exist "%SPEECH_BACKEND%" (
     set SETUP_REASON=whisper.cpp speech backend is missing.
     goto :run_setup
 )
-if not exist "%TTS_RUNTIME%" (
-    set SETUP_REASON=Kokoro text-to-speech runtime is missing.
-    goto :run_setup
-)
+:: Kokoro TTS is optional: a missing TTS runtime must not block image/text app startup.
 if exist "%CUDA_BACKEND%" goto :launch
 if exist "%VULKAN_BACKEND%" goto :launch
 set SETUP_REASON=No backend binary is installed.
@@ -117,7 +114,7 @@ echo   Web UI:     http://localhost:%FRONTEND_PORT%
 echo   GPU API:    Auto-selected by the app (starts at 8080)
 echo   Text API:   Starts when a GGUF model is loaded (port %LLM_PORT%)
 echo   Speech:     Managed locally by the app
-echo   TTS:        Managed locally by the app
+echo   TTS:        Optional (requires Kokoro runtime)
 echo.
 echo   Press Ctrl+C in this window to stop all services.
 echo  ============================================================

@@ -1,5 +1,6 @@
 // Tauri API helper for desktop mode, falling back to HTTP/Mock in browser
 import { invoke } from "@tauri-apps/api/core";
+import { createGenerationFailure } from "./generationFailure.js";
 
 // Helper to check if running inside Tauri desktop container
 export const isTauri = () => {
@@ -122,9 +123,9 @@ export async function cleanupCandidates(ids) {
   return await readJsonResponse(res, "The local server returned invalid cleanup data.");
 }
 
-// Get CPU and GPU specifications
-export async function getHardwareSpecs() {
-  if (cachedSpecs) return cachedSpecs;
+// Get CPU and GPU specifications. Pass { refresh: true } after a hardware/driver change.
+export async function getHardwareSpecs({ refresh = false } = {}) {
+  if (cachedSpecs && !refresh) return cachedSpecs;
 
   if (isTauri()) {
     try {
@@ -137,13 +138,16 @@ export async function getHardwareSpecs() {
 
   if (isLocalServerMode()) {
     try {
-      const res = await fetch("/api/hardware-specs");
-      if (res.ok) {
-        cachedSpecs = await res.json();
-        return cachedSpecs;
+      const res = await fetch(`/api/hardware-specs${refresh ? "?refresh=1" : ""}`);
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Hardware detection failed (HTTP ${res.status})`);
       }
+      cachedSpecs = data;
+      return cachedSpecs;
     } catch (e) {
       console.warn("Failed to get hardware specs from local server:", e);
+      if (refresh) throw e;
     }
   }
 
@@ -314,6 +318,20 @@ export async function stopServer() {
   return "Backend stopped";
 }
 
+// Reads the header of a local .safetensors model and returns its warnings. Returns null when the
+// check cannot be made. Generation is never blocked by this check.
+export async function inspectModelFile(filename) {
+  if (!filename || !isLocalServerMode()) return null;
+  try {
+    const res = await fetch(`/api/models/inspect?file=${encodeURIComponent(filename)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data && data.ok ? data : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Get current backend status and active settings
 export async function getBackendStatus() {
   try {
@@ -455,7 +473,7 @@ export async function chatWithLlm(messages, options = {}) {
       seed: options.seed,
       stop: options.stop,
       useWeb: options.useWeb === true,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
     }),
   });
   const data = await readJsonResponse(res, "The local text model returned an invalid response.");
@@ -486,7 +504,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
       seed: options.seed,
       stop: options.stop,
       useWeb: options.useWeb === true,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
     }),
   };
   if (options.signal) {
@@ -509,6 +527,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
   let timings = null;
   let finishReason = null;
   let webSources = [];
+  let webResearch = null;
 
   const normalizeTextDelta = (value) => {
     if (typeof value === "string") return value;
@@ -545,6 +564,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
       const parsed = JSON.parse(data);
       if (eventName === "web_sources") {
         webSources = parsed.sources || [];
+        webResearch = { research: parsed.research || null, findings: parsed.findings || [] };
         return false;
       }
       const choice = parsed.choices?.[0];
@@ -596,7 +616,25 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
 
   if (!finished && buffer.trim()) consumeEvent(buffer);
   if (!content && !reasoningContent) throw new Error("The text model returned an empty streamed response.");
-  return { content, reasoningContent, usage, timings, finishReason, webSources };
+  return { content, reasoningContent, usage, timings, finishReason, webSources, webResearch };
+}
+
+// Checks a finished answer against the web evidence it was given. Returns null if the check cannot run.
+export async function auditWebAnswer(text, webResearch) {
+  try {
+    const res = await fetch("/api/web-research/audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        webResearch: { sources: webResearch?.sources || [], findings: webResearch?.findings || [] },
+      }),
+    });
+    const data = await res.json();
+    return data?.audit || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 export async function searchWeb(query, options = {}) {
@@ -605,7 +643,7 @@ export async function searchWeb(query, options = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       query,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
       resultLimit: options.resultLimit,
       fetchLimit: options.fetchLimit,
     }),
@@ -934,7 +972,22 @@ export async function generateImage(prompt, negativePrompt, constraints, activeM
         height: payload.height,
       }),
     });
-    const data = await readJsonResponse(response, "The local server returned an invalid OpenVINO generation response.");
+    // A failed OpenVINO response keeps its message and category, like the image backend path below.
+    const openvinoText = await response.text().catch(() => "");
+    let data = null;
+    try { data = JSON.parse(openvinoText || "null"); } catch (_) { data = null; }
+    if (!response.ok || (data && data.ok === false)) {
+      const bodyMessage = data && typeof data.error === "string" && data.error ? data.error : `Generation failed (HTTP ${response.status})`;
+      throw createGenerationFailure({
+        status: response.status,
+        category: response.headers?.get?.("X-Studio-Error-Category") || data?.errorCategory || null,
+        message: bodyMessage,
+        raw: openvinoText || `HTTP ${response.status}`,
+      });
+    }
+    if (data === null || typeof data !== "object") {
+      throw new Error("The local server returned an invalid OpenVINO generation response.");
+    }
     const imgB64 = data?.data?.[0]?.b64_json;
     if (!imgB64) throw new Error("OpenVINO generation did not return an image.");
     const normalizedB64 = String(imgB64).replace(/^data:[^;]+;base64,/, "");
@@ -1026,17 +1079,25 @@ export async function generateImage(prompt, negativePrompt, constraints, activeM
         };
       }
     } else {
-      let errMsg = `Generation failed (HTTP ${response.status})`;
-      try {
-        const errJson = await response.json();
-        if (errJson?.detail || errJson?.error?.message) {
-          errMsg = errJson.detail || errJson.error.message;
-        }
-      } catch (_) {}
-      throw new Error(errMsg);
+      // The body is kept as a sanitized diagnostic. The category comes from the server header.
+      // Nothing is retried and no other backend is tried.
+      const rawText = await response.text().catch(() => "");
+      let parsed = null;
+      try { parsed = JSON.parse(rawText || "null"); } catch (_) { parsed = null; }
+      const bodyMessage = typeof parsed?.detail === "string" ? parsed.detail
+        : typeof parsed?.error === "string" ? parsed.error
+        : typeof parsed?.error?.message === "string" ? parsed.error.message
+        : null;
+      const category = response.headers?.get?.("X-Studio-Error-Category") || parsed?.errorCategory || null;
+      throw createGenerationFailure({
+        status: response.status,
+        category,
+        message: bodyMessage || `Generation failed (HTTP ${response.status})`,
+        raw: rawText || `HTTP ${response.status}`,
+      });
     }
   } catch (err) {
-    if (err.name === "AbortError" || err.message.startsWith("Generation failed")) throw err;
+    if (err.name === "AbortError" || err.generationFailure || err.message.startsWith("Generation failed")) throw err;
     console.warn("Could not reach local server.", err);
     throw new Error(
       "The image generation server is not responding or crashed. " +
