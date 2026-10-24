@@ -81,6 +81,11 @@ function primaryEvidence(source, id) {
     };
   }
   if (source.page && subjectIdOf(source) === id) {
+    // The identifier must appear in the page's own title or text. An identifier that appears only in the URL is not
+    // enough, so a source's classification never verifies a fact by itself.
+    const pageNamesId = [source.page.title, ...source.page.sentences]
+      .some((text) => extractIdentifiers(String(text || "")).some((item) => item.id === id));
+    if (!pageNamesId) return null;
     // A record page is about one identifier. If it names no other identifier (aliases excepted), the whole
     // page is its text. Otherwise only the sentences that name this identifier count.
     const otherIds = source.page.sentences
@@ -188,7 +193,48 @@ function exploitationFor({ id, primary, kevEntry, kevIndex, readSentences }) {
   return { status: "no-exploitation-stated", basis: "stated in a read source", source: none.source };
 }
 
-function buildFindings({ subject = null, sources = [], lookups = new Map(), kev = null, maxFindings = 8 } = {}) {
+// Where a finding falls against the selected date range. Dates come only from primary records (identifier's own
+// publication date) and from read pages (the date of the article that mentions it). A search engine's date filter
+// is never used as a date.
+function recencyFor({ window, published, articleDate }) {
+  const pub = published ? published.value : null;
+  const art = articleDate ? articleDate.value : null;
+  if (!window || !window.from) {
+    return {
+      label: "no-date-range",
+      detail: pub ? `published ${pub} (primary record); no date range applied` : "publication date not established by a primary record; no date range applied",
+    };
+  }
+  const range = `${window.from} to ${window.to}`;
+  if (pub && pub >= window.from) return { label: "published-in-range", detail: `published ${pub}, inside the date range (${range})` };
+  if (pub && art && art >= window.from) {
+    return { label: "older-mentioned-in-range", detail: `published ${pub}, before the date range (${range}); a read article dated ${art}, inside the range, mentions it` };
+  }
+  if (pub) return { label: "published-before-range", detail: `published ${pub}, before the date range (${range})` };
+  if (art && art >= window.from) {
+    return { label: "reported-in-range", detail: `publication date not established; a read article dated ${art}, inside the date range (${range}), mentions it` };
+  }
+  return { label: "date-unknown", detail: `publication date not established by a primary record (date range ${range})` };
+}
+
+const RECENCY_NOTES = {
+  "published-before-range": "Published before the selected date range. Do not describe it as a recent discovery.",
+  "older-mentioned-in-range": "Published before the selected date range, but recent coverage mentions it. Describe it as an older vulnerability mentioned in recent coverage, not as a new discovery.",
+  "reported-in-range": "A read article is inside the date range, but the identifier's own publication date is not established. Do not describe it as a recent discovery.",
+  "date-unknown": "No publication date could be established, so this cannot be placed in the date range. Do not describe it as recent.",
+};
+
+// Ordering. Status comes first, so a recent mention never outranks a conflict or an unverified identifier as though
+// it were verified. For latest/current questions, findings within a status are ordered newest first. Unknown dates
+// go last. The identifier only breaks ties.
+function compareDatesNewestFirst(a, b) {
+  if (!a && !b) return 0;
+  if (!a) return 1;
+  if (!b) return -1;
+  return b.localeCompare(a);
+}
+
+function buildFindings({ subject = null, sources = [], lookups = new Map(), kev = null, maxFindings = 8, window = null, recencyFocus = false } = {}) {
   const candidates = new Map();
   const addCandidate = (id, type) => {
     if (!candidates.has(id)) candidates.set(id, { id, type, searchHit: false, read: false });
@@ -223,16 +269,24 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
         if (sentenceHas(sentence, id)) readSentences.push({ sentence, source: source.index });
       }
     }
-    const linked = subject === null
-      ? []
-      : readSentences.filter((item) => {
-        if (!mentionsSubject(item.sentence, subject)) return false;
-        const sameFamily = extractIdentifiers(item.sentence).filter((x) => x.type === candidate.type);
-        return sameFamily.length === 1;
-      });
+    // A sentence links the identifier when it names exactly one identifier of that family. With a subject, it must
+    // also name the subject. With no subject (a broad question), the identifier alone is the anchor, and the note
+    // below says that no product was checked.
+    const linked = readSentences.filter((item) => {
+      if (subject !== null && !mentionsSubject(item.sentence, subject)) return false;
+      const sameFamily = extractIdentifiers(item.sentence).filter((x) => x.type === candidate.type);
+      return sameFamily.length === 1;
+    });
     const ambiguous = subject === null
       ? []
       : readSentences.filter((item) => mentionsSubject(item.sentence, subject) && !linked.includes(item));
+
+    const sourceByIndex = new Map(sources.map((item) => [item.index, item]));
+    const articleDates = linked
+      .map((item) => ({ value: sourceByIndex.get(item.source)?.published || sourceByIndex.get(item.source)?.page?.published || null, source: item.source }))
+      .filter((item) => item.value)
+      .sort((a, b) => b.value.localeCompare(a.value));
+    const articleDate = articleDates[0] || null;
 
     // Keep only identifiers that relate to the question: a primary record, a lookup made for it, a read
     // sentence that links it to the subject, an ambiguous read mention, or a search hit that names the subject.
@@ -285,6 +339,16 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
       : null;
 
     const notes = [];
+    const published = verified && primary.published ? { value: primary.published, source: primary.sourceIndex } : null;
+    const recency = recencyFor({ window, published, articleDate });
+    if (RECENCY_NOTES[recency.label]) notes.push(RECENCY_NOTES[recency.label]);
+    if (recency.label === "no-date-range" && recencyFocus && !published) {
+      notes.push("No date range was applied, and no primary publication date is known. Do not describe it as recent.");
+    }
+    if (subject === null) {
+      notes.push("No product was named in the question, so no product check was made against the question.");
+      if (linked.length) notes.push("A read sentence names this identifier only. It does not establish the product.");
+    }
     if (primary?.rejected) notes.push("The CVE record is marked REJECTED. It is not treated as a valid identifier.");
     if (primary?.aliases?.length) notes.push(`The EUVD record lists ${primary.aliases.join(", ")} as alias(es). These are not verified until their own CVE records are read.`);
     if (productCheck === "mismatch") notes.push("The primary record for this identifier does not name the subject of the question. It is not linked to that subject.");
@@ -319,7 +383,9 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
         const value = versionsText(primary.products);
         return value ? { value, source: primary.sourceIndex } : null;
       })() : null,
-      published: verified && primary.published ? { value: primary.published, source: primary.sourceIndex } : null,
+      published,
+      articleDate,
+      recency,
       updated: verified && primary.updated ? { value: primary.updated, source: primary.sourceIndex } : null,
       cvss: verified && primary.cvss ? { value: cvssText(primary.cvss), source: primary.sourceIndex, basis: "stated in the primary record" } : null,
       reportedSeverity: severityFromRead ? { value: severityFromRead.severity.value, source: severityFromRead.item.source, basis: "stated in a read source; not verified" } : null,
@@ -342,7 +408,12 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
   }
 
   const rank = { verified: 0, conflict: 1, "primary-unavailable": 2, "primary-not-found": 3, reported: 4, "mentioned-unlinked": 5, "search-only": 6 };
-  findings.sort((a, b) => (rank[a.status] - rank[b.status]) || a.identifier.localeCompare(b.identifier));
+  // Newest first within a status group for latest/current questions. A verified finding is dated by its primary
+  // record only. Other findings use the date of the article that mentions them, if one is known.
+  const dateKey = (finding) => (finding.status === "verified" ? finding.published?.value : finding.published?.value || finding.articleDate?.value) || null;
+  findings.sort((a, b) => (rank[a.status] - rank[b.status])
+    || (recencyFocus ? compareDatesNewestFirst(dateKey(a), dateKey(b)) : 0)
+    || a.identifier.localeCompare(b.identifier));
   return findings.slice(0, Math.max(1, maxFindings)).map((finding, index) => ({ ...finding, id: `F${index + 1}` }));
 }
 

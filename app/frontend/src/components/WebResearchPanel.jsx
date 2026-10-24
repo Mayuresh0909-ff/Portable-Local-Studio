@@ -107,12 +107,21 @@ function FindingRow({ finding }) {
   );
 }
 
+// The audit is a deterministic consistency check. The label and note say that it is not a guarantee of truth.
 function AuditLine({ audit }) {
   if (!audit) return null;
+  const label = audit.note ? (
+    <div style={{ ...muted, fontSize: "0.72rem" }}>
+      Deterministic consistency check, not a guarantee of truth. {audit.note}
+    </div>
+  ) : null;
   if (audit.ok && audit.issues.length === 0) {
     return (
-      <div style={{ ...muted, marginTop: "8px", fontSize: "0.76rem" }}>
-        Citation check: no problems found ({audit.checked.citations} citations, {audit.checked.identifiers} identifiers).
+      <div style={{ marginTop: "8px" }}>
+        <div style={{ ...muted, fontSize: "0.76rem" }}>
+          Citation check: no problems found ({audit.checked.citations} citations, {audit.checked.identifiers} identifiers).
+        </div>
+        {label}
       </div>
     );
   }
@@ -121,6 +130,7 @@ function AuditLine({ audit }) {
       <div style={{ fontWeight: 700, color: audit.ok ? "#9a6700" : "#b3261e" }}>
         {audit.ok ? "Citation check: warnings" : "Citation check: problems found. Check these before relying on the answer."}
       </div>
+      {label}
       {audit.issues.map((issue, index) => (
         <div key={`${issue.type}-${index}`} style={{ color: issue.severity === "error" ? "#b3261e" : "inherit" }}>
           • {issue.detail}

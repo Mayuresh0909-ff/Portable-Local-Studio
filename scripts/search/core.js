@@ -3,14 +3,14 @@ const { webSearch } = require("./providers");
 const { fetchPageContent, fetchRawDocument } = require("./content");
 const { readCache, writeCache } = require("./cache");
 const { classifySource, TIER_RANK } = require("./sources");
-const { extractIdentifiers } = require("./identifiers");
+const { extractIdentifiers, uniqueIds } = require("./identifiers");
 const { parseCveRecord, parseNvdResponse, parseKevCatalog, parsePageText, splitSentences } = require("./records");
 const { buildFindings, mentionsSubject } = require("./evidence");
 const { resolveTimeWindow, intentOf, extractSubject, todayIso, USER_TIME_ZONE } = require("./planner");
 const { buildContext } = require("./context");
 
 // Bump when the evidence rules change so cached results from an older pipeline are not reused.
-const PIPELINE_VERSION = 3;
+const PIPELINE_VERSION = 4;
 const KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
 const KEV_TTL_MS = 6 * 60 * 60 * 1000;
 const KEV_MAX_BYTES = 8 * 1024 * 1024;
@@ -61,12 +61,14 @@ function isBlockedError(message) {
   return /blocked|Private network|Localhost|Only HTTP/i.test(String(message || ""));
 }
 
-function createState({ cfg, deps, cacheDir, now }) {
+function createState({ cfg, deps, cacheDir, now, questionIds = [] }) {
   return {
     cfg,
     deps,
     cacheDir,
     now,
+    // CVE identifiers named in the question. They are looked up first, whatever the search results say.
+    questionIds,
     deadline: Date.now() + cfg.totalTimeoutMs,
     searches: [],
     searchesUsed: 0,
@@ -299,6 +301,8 @@ async function loadKev(state) {
 // or in read sentences that name it. Without a subject, every search identifier is a candidate.
 function lookupCandidates(state, subject) {
   const counts = new Map();
+  // Identifiers named in the question come first. Their count is high enough to outrank anything in the results.
+  for (const id of state.questionIds || []) counts.set(id, 1000);
   for (const source of state.registry) {
     if (source.origin !== "search") continue;
     const text = [source.title, source.snippet].filter(Boolean).join(" \n ");
@@ -310,7 +314,8 @@ function lookupCandidates(state, subject) {
   for (const source of state.registry) {
     if (source.fetchStatus !== "fetched" || !source.page) continue;
     for (const sentence of source.page.sentences) {
-      if (!subject || !mentionsSubject(sentence, subject)) continue;
+      // With no subject, every CVE in a read page is a candidate. The per-request lookup cap still applies.
+      if (subject && !mentionsSubject(sentence, subject)) continue;
       for (const item of extractIdentifiers(sentence)) {
         if (item.type === "cve") counts.set(item.id, (counts.get(item.id) || 0) + 1);
       }
@@ -418,29 +423,38 @@ async function comprehensiveWebSearch(query, options = {}) {
     fetchPage: options.deps?.fetchPage || fetchPageContent,
     fetchRaw: options.deps?.fetchRaw || fetchRawDocument,
   };
-  const state = createState({ cfg, deps, cacheDir, now });
+  const questionIds = [...new Set(uniqueIds(trimmed, "cve"))];
+  const state = createState({ cfg, deps, cacheDir, now, questionIds });
   const subject = subjectInfo.subject;
+  const recencyFocus = intent.current;
+  const buildAll = () => buildFindings({
+    subject, sources: state.registry, lookups: state.lookups, kev: state.kev, maxFindings: cfg.maxFindings,
+    window, recencyFocus,
+  });
 
   // Search 1: the question as asked.
   await searchOnce(state, trimmed, "question", window);
 
   // Search 2: for security questions with no identifier in the results, look for the identifiers of the subject.
-  if (intent.security && subject && !anyCve(state.registry.filter((s) => s.origin === "search"))) {
-    const discovery = `${subject} CVE vulnerability`;
-    if (discovery.toLowerCase() !== trimmed.toLowerCase()) await searchOnce(state, discovery, "identifier discovery", window);
+  // With no subject (a broad question), the same search runs with the question's own words, so broad research still
+  // finds identifiers. It is skipped when the question already names identifiers.
+  if (intent.security && !anyCve(state.registry.filter((s) => s.origin === "search")) && questionIds.length === 0) {
+    const discovery = subject ? `${subject} CVE vulnerability` : `${trimmed} CVE`;
+    if (discovery.toLowerCase() !== trimmed.toLowerCase()) await searchOnce(state, discovery, subject ? "identifier discovery" : "broad identifier discovery", window);
   }
 
   await gather(state, subject);
 
-  let findings = buildFindings({ subject, sources: state.registry, lookups: state.lookups, kev: state.kev, maxFindings: cfg.maxFindings });
+  let findings = buildAll();
 
-  // Search 3: one more search for a candidate identifier that is still not verified.
-  if (intent.security && subject && state.searchesUsed < cfg.maxSearches && timeLeft(state)) {
+  // Search 3: one more search for a candidate identifier that is still not verified. This applies with or without a
+  // subject, within the same search cap.
+  if (intent.security && state.searchesUsed < cfg.maxSearches && timeLeft(state)) {
     const unresolved = findings.find((finding) => finding.identifierType === "cve" && finding.status !== "verified" && finding.searchSources.length && !state.searches.some((s) => s.query.includes(finding.identifier)));
     if (unresolved) {
       await searchOnce(state, `"${unresolved.identifier}"`, "identifier check", window);
       await gather(state, subject);
-      findings = buildFindings({ subject, sources: state.registry, lookups: state.lookups, kev: state.kev, maxFindings: cfg.maxFindings });
+      findings = buildAll();
     }
   }
 
@@ -449,7 +463,7 @@ async function comprehensiveWebSearch(query, options = {}) {
     "The DuckDuckGo date filter is approximate and is not checked per result. Publication dates come from read pages and records only.",
     "Only the sources listed were checked. Other sources were not examined.",
   ];
-  if (!subject) limitations.push("No subject term was identified, so product association was not checked.");
+  if (!subject) limitations.push("No product or entity was named in the question, so no product check was made. Identifiers were still looked up within the same limits.");
   if (state.kev && state.kev.status !== "ok") limitations.push("The CISA KEV catalogue could not be checked, so KEV status is unknown.");
   const failedLookups = [...state.lookups.entries()].filter(([, entry]) => !entry.record).map(([id]) => id);
   if (failedLookups.length) limitations.push(`No primary record was retrieved for: ${failedLookups.join(", ")}.`);
@@ -466,6 +480,7 @@ async function comprehensiveWebSearch(query, options = {}) {
     subject: { value: subject, method: subjectInfo.method },
     intent,
     timeWindow: window,
+    recencyFocus,
     searches: state.searches,
     budget: {
       maxSearches: cfg.maxSearches,

@@ -51,6 +51,7 @@ function findingLines(finding) {
   }
   if (finding.affectedVersions) lines.push(`  affected versions: ${finding.affectedVersions.value} ${refs([finding.affectedVersions.source])}`);
   if (finding.published) lines.push(`  published: ${finding.published.value} ${refs([finding.published.source])}`);
+  if (finding.recency) lines.push(`  date relation to the date range: ${finding.recency.detail}`);
   if (finding.updated) lines.push(`  last updated: ${finding.updated.value} ${refs([finding.updated.source])}`);
   if (finding.cvss) lines.push(`  severity (stated in primary record): ${finding.cvss.value} ${refs([finding.cvss.source])}`);
   if (finding.reportedSeverity) lines.push(`  severity (stated in a read source, not verified): ${finding.reportedSeverity.value} ${refs([finding.reportedSeverity.source])}`);
@@ -75,6 +76,7 @@ function buildContext({ query, research, findings, sources, maxChars = 12000 }) 
     "4. Cite only source numbers that appear in this evidence, such as [3]. Do not cite a source for a claim it does not contain.",
     "5. Do not fill gaps from memory. If a fact is not in this evidence, say it was not found.",
     "6. When the question is about recent events, use the date range below and say what it was.",
+    "7. Describe a finding as recent or as a new discovery only when its date relation says it is inside the date range. Never infer a date that is not listed.",
   ];
 
   const status = [
@@ -82,7 +84,8 @@ function buildContext({ query, research, findings, sources, maxChars = 12000 }) 
     "RESEARCH STATUS",
     `Current date (${research.timezone}): ${research.currentDate}`,
     `Date filter: ${research.timeWindow.applied ? `${research.timeWindow.label}, ${research.timeWindow.from} to ${research.timeWindow.to} (${research.timeWindow.source === "explicit" ? "chosen by the user" : "inferred from the question"})` : research.timeWindow.source === "explicit-any" ? "no date filter (chosen by the user)" : "no date filter"}`,
-    `Subject term: ${research.subject.value || "none identified"}`,
+    `Subject term: ${research.subject.value || "none identified (broad question: no product was checked against it)"}`,
+    ...(research.recencyFocus ? ["Ordering: findings are newest first within each status group, by primary record date. Findings with unknown dates come last."] : []),
     `Searches run: ${research.budget.searchesUsed} of ${research.budget.maxSearches}. Pages read: ${research.budget.pagesRead}. Record lookups: ${research.budget.lookups}. Time limit reached: ${research.budget.timedOut ? "yes" : "no"}.`,
     ...(research.error ? [`Web search error: ${research.error}. No web evidence is available for this question. Say so.`] : []),
     ...research.limitations.map((item) => `Limitation: ${item}`),

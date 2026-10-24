@@ -71,21 +71,49 @@ function intentOf(query) {
   };
 }
 
-// The main subject of the question, e.g. "PHP2Shell" or "News Kit Addons for Elementor".
-// Order: quoted text, then the longest run of capitalised or numeric words, then the first run of
-// non-stopwords. The result is used only to check product association, so a wrong guess makes
-// findings "not verified" rather than linking a wrong product.
+// Words that describe a question rather than name a product. A single capitalised word from this list is never
+// a subject ("Discovered exploits ...", "Cybersecurity news ..."). Inside a longer name they are kept
+// ("News Kit Addons for Elementor"), so product names are not cut.
+const DESCRIPTIVE_WORDS = new Set([
+  "active", "actively", "attacks", "biggest", "big", "breaches", "common", "critical", "current", "cyber", "cybersecurity",
+  "day", "days", "discovered", "disclosed", "exploitable", "exploited", "flaws", "high", "important", "incidents", "known",
+  "latest", "major", "malware", "month", "new", "news", "notable", "popular", "public", "ransomware", "recent", "recently",
+  "reported", "serious", "software", "systems", "threats", "today", "top", "updates", "patches", "advisories", "vulnerabilities",
+  "vulnerable", "week", "worst", "year", "zero",
+]);
+
+// Question words that are never the first word of a product name. A capitalised one at the start of a run is skipped,
+// so "Discovered PHP2Shell exploits" gives PHP2Shell. Words that can start a product name ("Active Directory", "News
+// Kit") are deliberately not in this list.
+const LEADING_QUESTION_WORDS = new Set([
+  "actively", "discovered", "disclosed", "exploitable", "exploited", "latest", "newest", "newly", "popular", "recent",
+  "recently", "reported", "current", "worst", "biggest",
+]);
+
+// A lowercase or mixed token that mixes letters and digits, such as "log4j" or "7zip". Plain numbers are not products.
+const PRODUCT_LIKE = /^(?=.*[a-z])(?=.*\d)[a-z0-9][a-z0-9._+-]*$/i;
+
+// The main subject of the question, or null when the question names no product or entity.
+// Order: quoted text, then the longest run of capitalised or product-like words. Lowercase descriptive words are
+// never used as a subject. A question such as "What are the latest discovered exploits?" has no subject, and the
+// research then runs as a broad search without a product check.
 function extractSubject(query) {
   const text = String(query || "").trim();
-  const quoted = text.match(/["“]([^"”]{2,80})["”]/);
+  const quoted = text.match(/[\"“]([^\"”]{2,80})[\"”]/);
   if (quoted) return { subject: quoted[1].trim(), method: "quoted" };
 
-  const tokens = text.replace(/[?!.,;:()[\]{}"“”']/g, " ").split(/\s+/).filter(Boolean);
+  const tokens = text.replace(/[?!.,;:()[\]{}\"“”']/g, " ").split(/\s+/).filter(Boolean);
   const isId = (token) => /^(CVE|EUVD|GHSA)-/i.test(token);
-  const isSignal = (token) => !isId(token) && /^[A-Z0-9]/.test(token) && !STOPWORDS.has(token.toLowerCase());
+  const isSignal = (token) => {
+    if (isId(token)) return false;
+    const lower = token.toLowerCase();
+    if (STOPWORDS.has(lower)) return false;
+    return /^[A-Z]/.test(token) || PRODUCT_LIKE.test(token);
+  };
   const runs = [];
   for (let i = 0; i < tokens.length; i += 1) {
     if (!isSignal(tokens[i])) continue;
+    if (LEADING_QUESTION_WORDS.has(tokens[i].toLowerCase())) continue;
     const run = [tokens[i]];
     let j = i + 1;
     while (j < tokens.length) {
@@ -99,16 +127,14 @@ function extractSubject(query) {
         break;
       }
     }
-    runs.push(run.join(" "));
+    // A lone descriptive word is not a name.
+    if (!(run.length === 1 && DESCRIPTIVE_WORDS.has(run[0].toLowerCase()))) runs.push(run.join(" "));
     i = j - 1;
   }
   if (runs.length) {
     const longest = runs.reduce((best, run) => (run.split(" ").length > best.split(" ").length ? run : best));
-    return { subject: longest, method: "capitalised" };
+    return { subject: longest, method: "named" };
   }
-
-  const plain = tokens.filter((token) => !isId(token) && !STOPWORDS.has(token.toLowerCase()));
-  if (plain.length) return { subject: plain.slice(0, 3).join(" "), method: "lowercase" };
   return { subject: null, method: null };
 }
 
@@ -119,4 +145,5 @@ module.exports = {
   resolveTimeWindow,
   intentOf,
   extractSubject,
+  DESCRIPTIVE_WORDS,
 };
