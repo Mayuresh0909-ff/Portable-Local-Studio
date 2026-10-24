@@ -25,7 +25,7 @@ function decodeHtml(value) {
 function isPrivateIpv4(ip) {
   const parts = String(ip || "").split(".").map((part) => Number(part));
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [a, b] = parts;
+  const [a, b, c] = parts;
   return a === 0 ||
     a === 10 ||
     a === 127 ||
@@ -33,7 +33,10 @@ function isPrivateIpv4(ip) {
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||     // 192.0.0.0/24 and TEST-NET-1 192.0.2.0/24
     (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||               // TEST-NET-2
+    (a === 203 && b === 0 && c === 113) ||                // TEST-NET-3
     a >= 224;
 }
 
@@ -58,6 +61,7 @@ function isPrivateIpv6(ip) {
   const first = parseInt(value.split(":")[0] || "0", 16);
   return value === "::1" ||
     value === "::" ||
+    value.startsWith("2001:db8:") ||                  // documentation range 2001:db8::/32
     (first & 0xfe00) === 0xfc00 ||   // fc00::/7 unique local
     (first & 0xffc0) === 0xfe80 ||   // fe80::/10 link local
     (first & 0xff00) === 0xff00;     // ff00::/8 multicast
@@ -153,6 +157,28 @@ function acceptableContentType(contentType) {
   return contentType.includes("text/") || contentType.includes("html") || contentType.includes("xml") || contentType.includes("json");
 }
 
+// Options for one outbound request. The address a connection uses is the one safeLookup returns at connect time,
+// because Node calls the `lookup` option whenever it opens a socket. That lookup refuses any private record, so a
+// hostname that resolved publicly during the early check cannot connect to a private address.
+//  - agent: false. The default keep-alive agent can reuse a socket without calling lookup again. Every request
+//    gets its own socket, so every connection is resolved and checked.
+//  - servername. TLS uses the hostname for SNI and certificate checks, never the IP address.
+function connectionOptions(parsed, timeoutMs) {
+  const host = bareHost(parsed.hostname);
+  const options = {
+    headers: {
+      "User-Agent": USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.2",
+      "Accept-Encoding": "gzip, deflate, br",
+    },
+    timeout: timeoutMs,
+    lookup: safeLookup,
+    agent: false,
+  };
+  if (parsed.protocol === "https:" && !net.isIP(host)) options.servername = host;
+  return options;
+}
+
 // Fetches a text, HTML, XML or JSON document. Every redirect target is validated before it is followed.
 // Resolves to { url, status, contentType, body }. Rejects on a blocked, failed or oversized response.
 async function fetchRawDocument(rawUrl, options = {}, redirects = 0) {
@@ -164,15 +190,7 @@ async function fetchRawDocument(rawUrl, options = {}, redirects = 0) {
   const transport = parsed.protocol === "https:" ? https : http;
 
   return new Promise((resolve, reject) => {
-    const req = transport.get(parsed, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.2",
-        "Accept-Encoding": "gzip, deflate, br",
-      },
-      timeout: timeoutMs,
-      lookup: safeLookup,
-    }, async (res) => {
+    const req = transport.get(parsed, connectionOptions(parsed, timeoutMs), async (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         if (redirects >= MAX_REDIRECTS) {
@@ -236,6 +254,7 @@ async function fetchPageContent(rawUrl, options = {}) {
 module.exports = {
   fetchPageContent,
   fetchRawDocument,
+  connectionOptions,
   assertPublicUrl,
   safeLookup,
   isPrivateIp,

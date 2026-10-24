@@ -10,7 +10,7 @@ const { resolveTimeWindow, intentOf, extractSubject, todayIso, USER_TIME_ZONE } 
 const { buildContext } = require("./context");
 
 // Bump when the evidence rules change so cached results from an older pipeline are not reused.
-const PIPELINE_VERSION = 4;
+const PIPELINE_VERSION = 5;
 const KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
 const KEV_TTL_MS = 6 * 60 * 60 * 1000;
 const KEV_MAX_BYTES = 8 * 1024 * 1024;
@@ -175,6 +175,7 @@ async function readPage(state, source, subject) {
     source.page = parsed;
     source.title = page.title || source.title;
     source.published = parsed.published;
+    source.publishedMalformed = parsed.publishedMalformed;
     source.updated = parsed.updated;
     source.excerpt = excerptFor(page.text, state.cfg.contentChars, subject);
     source.fetchStatus = "fetched";
@@ -428,7 +429,7 @@ async function comprehensiveWebSearch(query, options = {}) {
   const subject = subjectInfo.subject;
   const recencyFocus = intent.current;
   const buildAll = () => buildFindings({
-    subject, sources: state.registry, lookups: state.lookups, kev: state.kev, maxFindings: cfg.maxFindings,
+    subject, sources: state.registry, lookups: state.lookups, kev: state.kev, maxFindings: cfg.maxFindings, today: todayIso(now),
     window, recencyFocus,
   });
 

@@ -115,12 +115,16 @@ function AuditLine({ audit }) {
       Deterministic consistency check, not a guarantee of truth. {audit.note}
     </div>
   ) : null;
+  const limits = (audit.limitations || []).map((item) => (
+    <div key={item} style={{ ...muted, fontSize: "0.76rem" }}>Not checked: {item}</div>
+  ));
   if (audit.ok && audit.issues.length === 0) {
     return (
       <div style={{ marginTop: "8px" }}>
         <div style={{ ...muted, fontSize: "0.76rem" }}>
-          Citation check: no problems found ({audit.checked.citations} citations, {audit.checked.identifiers} identifiers).
+          Citation check: no problems found ({audit.checked.citations} citations, {audit.checked.identifiers} identifiers, {audit.checked.claims ?? 0} claims checked against sources).
         </div>
+        {limits}
         {label}
       </div>
     );
@@ -131,6 +135,7 @@ function AuditLine({ audit }) {
         {audit.ok ? "Citation check: warnings" : "Citation check: problems found. Check these before relying on the answer."}
       </div>
       {label}
+      {limits}
       {audit.issues.map((issue, index) => (
         <div key={`${issue.type}-${index}`} style={{ color: issue.severity === "error" ? "#b3261e" : "inherit" }}>
           • {issue.detail}

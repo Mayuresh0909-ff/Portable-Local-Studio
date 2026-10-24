@@ -4,8 +4,9 @@
 // EXECUTED: every test here is local. IP literals and fixture HTML only. No DNS lookup and no connection is
 // made, so the tests pass offline and do not depend on any live site.
 //
-// NOT TESTED HERE: a live redirect chain and DNS rebinding. Those need a network test in a controlled
-// environment. The redirect rules are checked by reading the code (assertPublicUrl runs on every hop).
+// The connect-time check, DNS rebinding and redirect hops are tested with the DNS lookup and request function replaced,
+// in web-research-fetch.test.cjs. NOT TESTED HERE, OR THERE: a live redirect chain on the internet and a real TLS
+// handshake. Those need a live network test in a controlled environment.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

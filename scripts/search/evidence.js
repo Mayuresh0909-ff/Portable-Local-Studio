@@ -12,6 +12,7 @@
 
 const { extractIdentifiers } = require("./identifiers");
 const { exploitationStatement, severityStatement, splitSentences } = require("./records");
+const { todayIso } = require("./planner");
 
 const STATUS_LABELS = {
   verified: "Verified against a primary record",
@@ -73,6 +74,7 @@ function primaryEvidence(source, id) {
       productNames: record.productNames || [],
       products: record.products || [],
       published: record.published || null,
+      publishedMalformed: Boolean(record.publishedMalformed),
       updated: record.updated || null,
       cvss: record.cvss || null,
       ssvc: record.ssvcExploitation || null,
@@ -101,6 +103,7 @@ function primaryEvidence(source, id) {
       productNames: [],
       products: [],
       published: source.page.published || null,
+      publishedMalformed: Boolean(source.page.publishedMalformed),
       updated: source.page.updated || null,
       cvss: null,
       ssvc: null,
@@ -193,34 +196,75 @@ function exploitationFor({ id, primary, kevEntry, kevIndex, readSentences }) {
   return { status: "no-exploitation-stated", basis: "stated in a read source", source: none.source };
 }
 
-// Where a finding falls against the selected date range. Dates come only from primary records (identifier's own
+// Where one date falls against the selected range. Both ends are enforced. "future" is after today and is never
+// treated as recent. "after" is after the end of the range. "none" means no range was applied. Null means no date.
+function dateRelation(iso, window, today) {
+  if (!iso) return null;
+  if (today && iso > today) return "future";
+  if (!window || !window.from) return "none";
+  if (window.to && iso > window.to) return "after";
+  if (iso < window.from) return "before";
+  return "in";
+}
+
+// Where a finding falls against the selected date range. Dates come only from primary records (the identifier's own
 // publication date) and from read pages (the date of the article that mentions it). A search engine's date filter
-// is never used as a date.
-function recencyFor({ window, published, articleDate }) {
+// is never used as a date. A malformed date is labelled, not used.
+function recencyFor({ window, today, published, publishedMalformed = false, articleDate, articleMalformed = false }) {
   const pub = published ? published.value : null;
   const art = articleDate ? articleDate.value : null;
-  if (!window || !window.from) {
-    return {
-      label: "no-date-range",
-      detail: pub ? `published ${pub} (primary record); no date range applied` : "publication date not established by a primary record; no date range applied",
-    };
+  const range = window && window.from ? `${window.from} to ${window.to}` : null;
+  const pubRel = dateRelation(pub, window, today);
+  const artRel = dateRelation(art, window, today);
+
+  if (publishedMalformed && !pub) {
+    return { label: "date-malformed", detail: "the publication date in the primary record is not a valid calendar date; it is not used" };
   }
-  const range = `${window.from} to ${window.to}`;
-  if (pub && pub >= window.from) return { label: "published-in-range", detail: `published ${pub}, inside the date range (${range})` };
-  if (pub && art && art >= window.from) {
-    return { label: "older-mentioned-in-range", detail: `published ${pub}, before the date range (${range}); a read article dated ${art}, inside the range, mentions it` };
+  if (pub) {
+    if (pubRel === "future") {
+      return { label: "date-in-future", detail: `published ${pub}, which is after today (${today}); not treated as recent` };
+    }
+    if (pubRel === "none") {
+      return { label: "no-date-range", detail: `published ${pub} (primary record); no date range applied` };
+    }
+    if (pubRel === "after") {
+      return { label: "published-after-range", detail: `published ${pub}, after the date range (${range}); not inside the range` };
+    }
+    if (pubRel === "in") {
+      return { label: "published-in-range", detail: `published ${pub}, inside the date range (${range})` };
+    }
+    // The identifier was published before the range.
+    if (artRel === "in") {
+      return { label: "older-mentioned-in-range", detail: `published ${pub}, before the date range (${range}); a read article dated ${art}, inside the range, mentions it` };
+    }
+    const note = artRel === "future" || artRel === "after" ? ` A read article dated ${art} is outside the range, so it does not date this identifier.` : "";
+    return { label: "published-before-range", detail: `published ${pub}, before the date range (${range}).${note}` };
   }
-  if (pub) return { label: "published-before-range", detail: `published ${pub}, before the date range (${range})` };
-  if (art && art >= window.from) {
+
+  // No valid publication date from a primary record.
+  if (!range) {
+    return { label: "no-date-range", detail: "publication date not established by a primary record; no date range applied" };
+  }
+  if (articleMalformed && !art) {
+    return { label: "date-malformed", detail: "a read article gives a date that is not a valid calendar date; the publication date is not established" };
+  }
+  if (artRel === "in") {
     return { label: "reported-in-range", detail: `publication date not established; a read article dated ${art}, inside the date range (${range}), mentions it` };
+  }
+  if (artRel === "after" || artRel === "future") {
+    return { label: "reported-after-range", detail: `publication date not established; a read article dated ${art} is outside the date range (${range}), so it is not recent coverage` };
   }
   return { label: "date-unknown", detail: `publication date not established by a primary record (date range ${range})` };
 }
 
 const RECENCY_NOTES = {
   "published-before-range": "Published before the selected date range. Do not describe it as a recent discovery.",
+  "published-after-range": "Published after the selected date range. Do not describe it as inside the range.",
+  "date-in-future": "The record's publication date is after today, so it is not a valid recent date. Do not describe it as recent.",
+  "date-malformed": "A date in the source is not a valid calendar date, so it is not used. Do not describe it as recent.",
   "older-mentioned-in-range": "Published before the selected date range, but recent coverage mentions it. Describe it as an older vulnerability mentioned in recent coverage, not as a new discovery.",
   "reported-in-range": "A read article is inside the date range, but the identifier's own publication date is not established. Do not describe it as a recent discovery.",
+  "reported-after-range": "A read article is outside the date range, and the publication date is not established. Do not describe it as recent.",
   "date-unknown": "No publication date could be established, so this cannot be placed in the date range. Do not describe it as recent.",
 };
 
@@ -234,7 +278,8 @@ function compareDatesNewestFirst(a, b) {
   return b.localeCompare(a);
 }
 
-function buildFindings({ subject = null, sources = [], lookups = new Map(), kev = null, maxFindings = 8, window = null, recencyFocus = false } = {}) {
+function buildFindings({ subject = null, sources = [], lookups = new Map(), kev = null, maxFindings = 8, window = null, recencyFocus = false, today = null } = {}) {
+  const asOf = today || todayIso(new Date());
   const candidates = new Map();
   const addCandidate = (id, type) => {
     if (!candidates.has(id)) candidates.set(id, { id, type, searchHit: false, read: false });
@@ -287,6 +332,11 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
       .filter((item) => item.value)
       .sort((a, b) => b.value.localeCompare(a.value));
     const articleDate = articleDates[0] || null;
+    // A read article whose date is malformed is reported, and is not used for any date.
+    const articleMalformed = !articleDate && linked.some((item) => {
+      const source = sourceByIndex.get(item.source);
+      return Boolean(source?.publishedMalformed || source?.page?.publishedMalformed);
+    });
 
     // Keep only identifiers that relate to the question: a primary record, a lookup made for it, a read
     // sentence that links it to the subject, an ambiguous read mention, or a search hit that names the subject.
@@ -340,7 +390,8 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
 
     const notes = [];
     const published = verified && primary.published ? { value: primary.published, source: primary.sourceIndex } : null;
-    const recency = recencyFor({ window, published, articleDate });
+    const publishedMalformed = verified && Boolean(primary.publishedMalformed);
+    const recency = recencyFor({ window, today: asOf, published, publishedMalformed, articleDate, articleMalformed });
     if (RECENCY_NOTES[recency.label]) notes.push(RECENCY_NOTES[recency.label]);
     if (recency.label === "no-date-range" && recencyFocus && !published) {
       notes.push("No date range was applied, and no primary publication date is known. Do not describe it as recent.");
@@ -409,8 +460,15 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
 
   const rank = { verified: 0, conflict: 1, "primary-unavailable": 2, "primary-not-found": 3, reported: 4, "mentioned-unlinked": 5, "search-only": 6 };
   // Newest first within a status group for latest/current questions. A verified finding is dated by its primary
-  // record only. Other findings use the date of the article that mentions them, if one is known.
-  const dateKey = (finding) => (finding.status === "verified" ? finding.published?.value : finding.published?.value || finding.articleDate?.value) || null;
+  // record only. Other findings use the date of the article that mentions them, if one is known. A date that is
+  // future, malformed or after the range is not a sort key, so those findings go last with the unknown dates.
+  const sortableDate = (value) => {
+    const relation = dateRelation(value, window, asOf);
+    return relation === "none" || relation === "in" || relation === "before" ? value : null;
+  };
+  const dateKey = (finding) => sortableDate(finding.status === "verified"
+    ? finding.published?.value
+    : finding.published?.value || finding.articleDate?.value) || null;
   findings.sort((a, b) => (rank[a.status] - rank[b.status])
     || (recencyFocus ? compareDatesNewestFirst(dateKey(a), dateKey(b)) : 0)
     || a.identifier.localeCompare(b.identifier));
@@ -419,6 +477,8 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
 
 module.exports = {
   buildFindings,
+  dateRelation,
+  recencyFor,
   mentionsSubject,
   STATUS_LABELS,
   EXPLOITATION_LABELS,

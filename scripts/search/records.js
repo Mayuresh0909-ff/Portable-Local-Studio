@@ -3,17 +3,36 @@
 
 const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
 
+// True when the year, month and day form a real calendar date (2026-02-30 does not).
+function isCalendarDate(iso) {
+  const [year, month, day] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+// Returns YYYY-MM-DD for a date the text states, or null. An impossible calendar date gives null.
 function parseDate(value) {
   const text = String(value || "").trim();
   if (!text) return null;
   const iso = text.match(/(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  if (iso) {
+    const candidate = `${iso[1]}-${iso[2]}-${iso[3]}`;
+    return isCalendarDate(candidate) ? candidate : null;
+  }
   const named = text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b/i);
   if (named) {
     const month = MONTHS.indexOf(named[1].toLowerCase()) + 1;
-    return `${named[3]}-${String(month).padStart(2, "0")}-${String(Number(named[2])).padStart(2, "0")}`;
+    const candidate = `${named[3]}-${String(month).padStart(2, "0")}-${String(Number(named[2])).padStart(2, "0")}`;
+    return isCalendarDate(candidate) ? candidate : null;
   }
   return null;
+}
+
+// A date that the document states but that is not a valid date (for example 2026-02-30). It is reported as
+// malformed rather than dropped, so the evidence can say so.
+function isMalformedDate(value) {
+  const text = String(value || "").trim();
+  return Boolean(text) && parseDate(text) === null && /\d{4}-\d{2}-\d{2}/.test(text);
 }
 
 function formatVersionEntry(entry) {
@@ -84,6 +103,7 @@ function parseCveRecord(json) {
     products: affected,
     productNames: affected.flatMap((item) => [item.vendor, item.product]).filter(Boolean),
     published: parseDate(meta.datePublished),
+    publishedMalformed: isMalformedDate(meta.datePublished),
     updated: parseDate(meta.dateUpdated),
     cvss: cvssFromCveMetrics(allMetrics),
     ssvcExploitation,
@@ -128,6 +148,7 @@ function parseNvdResponse(json) {
     products: cpeRanges.length ? cpeRanges.map((range) => ({ vendor: null, product: range.product, versions: range.version ? [range.version] : [] })) : [],
     productNames: uniqueProducts,
     published: parseDate(item.published),
+    publishedMalformed: isMalformedDate(item.published),
     updated: parseDate(item.lastModified),
     cvss: cvssFromNvdMetrics(item.metrics || {}),
     ssvcExploitation: null,
@@ -192,6 +213,7 @@ function parsePageText(text, title = "") {
     title: String(title || "").trim() || null,
     sentences,
     published: dateMatch ? parseDate(dateMatch[1]) : null,
+    publishedMalformed: dateMatch ? isMalformedDate(dateMatch[1]) : false,
     updated: updatedMatch ? parseDate(updatedMatch[1]) : null,
   };
 }

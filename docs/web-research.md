@@ -28,9 +28,11 @@ The current date is **UTC** (checked against the server clock). The date range u
 For a *latest*, *current* or *recent* question, the findings are ordered by date, but status comes first:
 
 1. Status order is kept: Verified, then Conflict, then the other statuses. A recent secondary mention never moves a finding above a conflicting or unverified identifier as if it were verified.
-2. Within the same status, the newest date comes first. A verified finding uses its primary publication date. Other findings use the date of the read article that mentions them. Findings with no established date come last.
+2. Within the same status, the newest date comes first. A verified finding uses its primary publication date. Other findings use the date of the read article that mentions them. Findings with no established date, a future date, or a date after the range come last.
 
-Each finding carries one date label, and the Sources panel and the model's context both show it:
+**Both ends of the range are enforced.** The range runs from its start to its end, inclusive. The end is today for every automatic and "past" choice. A primary date is inside the range only when `start <= date <= end`. A date before the start is *before*. A date after the end is *after*. A date after today is *in the future*. A date that is not a real calendar date (for example `2026-02-30`) is *malformed*, is not used, and is labelled as such.
+
+Each finding gets one date relation, stored as the label in the first column below. The label name itself is internal. The model's context states the relation on a line `date relation to the date range: ...`. The Sources panel shows the matching sentence as a "Note:" under the finding, and only for the labels that have one (`no-date-range` and `published-in-range` have no note). The panel also shows the published and last-updated dates with their sources:
 
 | Label | Meaning | Use in an answer |
 | --- | --- | --- |
@@ -38,15 +40,23 @@ Each finding carries one date label, and the Sources panel and the model's conte
 | `published-in-range` | Verified primary publication date inside the range. | May be described as a recent publication. |
 | `older-mentioned-in-range` | Published before the range, but a read article dated inside the range mentions it. | Describe as an older vulnerability mentioned in recent coverage, not as a new discovery. |
 | `published-before-range` | Published before the range. | Do not describe it as a recent discovery. |
+| `published-after-range` | Verified primary publication date after the end of the range. | Do not describe it as inside the range. |
+| `date-in-future` | Verified primary publication date after today. | Not a valid recent date. Do not describe it as recent. |
 | `reported-in-range` | No primary date, but a read article dated inside the range mentions it. | Describe as reported in that article. The article date is not the CVE publication date. |
+| `reported-after-range` | No primary date, and the read article is dated after the range or in the future. | Do not describe it as recent coverage. |
+| `date-malformed` | A date in a source is not a valid calendar date. | Not used. Do not describe it as recent. |
 | `date-unknown` | No date can be established. | Do not describe it as recent. |
+
+A read article dated after the range, or in the future, never dates an identifier, and never makes an older identifier look recent.
 
 ## What a research run does
 
 1. Searches the question as asked, with the date filter chosen above.
-2. For security questions where the results contain no CVE and the question names none:
+2. For security questions where the results contain no CVE and the question names no identifier:
    - with a named subject, searches `<subject> CVE vulnerability`;
    - with no subject (a broad question), searches the question's own words with `CVE` added. This is the broad identifier search.
+   - If the question already names an identifier, this step is skipped.
+2a. If a candidate CVE is still not verified after the lookups, one more search may run for it, within the same search cap.
 3. Looks up each candidate CVE in the primary records: CVE Services first, then NVD if that fails. CISA KEV is read once and cached for six hours. Question CVEs are looked up first.
 4. Reads up to the page limit of search results. Pages from primary sources come first, then secondary sources.
 5. Builds structured findings with a status, a product check, an exploitation field, and a date label.
@@ -130,31 +140,54 @@ Classification alone never verifies a fact. A vendor advisory page is used as th
 
 `POST /api/web-research/audit` checks the written answer against the findings. It is a **deterministic consistency check, not a guarantee of truth**. Its result says so and carries the check's name, `deterministic-consistency-check`.
 
-It works per sentence and per claim:
+It works per sentence and per clause:
 
-- Each claim is checked against the identifiers in its own clause, or in its sentence when the clause names none.
+- A claim's identifiers are the clause's own, or the sentence's when the clause names none. A claim's citations are the clause's own, or the sentence's when the clause has none.
+- **Provenance.** A claim about an identifier must cite a source that supports that field of its finding. The check uses the finding's own source fields:
+  - *identity* (the identifier exists and is linked): the primary record, the read sources that link it, or the KEV catalogue;
+  - *product* (the identifier affects the subject): the verified primary record, or a read source that links the identifier to the subject. A search result that was never read does not count;
+  - *affected versions*: the primary record's version data only;
+  - *publication date*: the primary record's date; *article date*: the read article's date;
+  - *severity*: the primary record's CVSS, or a read source's stated severity (shown as not verified);
+  - *KEV listing*: the KEV catalogue entry only;
+  - *exploitation* (a confirmed status, CISA KEV or SSVC active): the source that establishes that status. **The identifier's own record is not a valid citation for an exploitation claim** unless that record is the source that states it.
+  A valid citation number that is unrelated to the claim is reported. If none of a claim's citations supports it, the result is an error. If some do and some do not, the unrelated citation is a warning. Neither is a clean result.
+- A primary record that supports the identifier does not support its exploitation status, severity or affected versions unless it is that field's source.
+- **Limitations, not passes.** The check cannot tell whether a sentence with no identifier is supported by its citation. Those citations are checked for existence only, and the result lists how many there were. A finding with no source fields (an older evidence shape) is also listed under "Not checked", not passed. Statements about identifiers with no citation are listed too.
 - A hedge such as "may", "reportedly" or "not verified" only applies to the segment it sits in, between the last clause boundary (`,` `;` `:` `(` or a contrast word such as "but") and the claim. An earlier hedged mention does not suppress a later unqualified claim.
 - A hedge in one clause does not neutralise a positive claim in another clause of the same sentence.
 - A generic claim with no identifiers ("the vulnerabilities are actively exploited") is supported only when **every** finding is confirmed. One KEV-listed finding is not enough.
 - A public proof-of-concept is not confirmed exploitation.
 - Citation numbers must match a listed source. An identifier with an EUVD number presented as a CVE number is flagged.
 
-It flags: an unverified identifier stated as fact, an unconfirmed exploitation claim, a generic exploitation claim that is not supported, an invalid citation, and possible EUVD-as-CVE confusion. It does not judge whether a sentence is true, whether a source is right, or whether the answer covers the question.
+It flags: an unverified identifier stated as fact, an unconfirmed exploitation claim, a generic exploitation claim that is not supported, an invalid citation, a citation that does not support its claim, and possible EUVD-as-CVE confusion. It does not judge whether a sentence is true, whether a source is right, or whether the answer covers the question.
 
-The server does not store the answer text. The result is shown in the Sources panel.
+The server does not store the answer text. The result is shown in the Sources panel. The panel states the check's name and that it is not a guarantee of truth, and it lists anything the check could not check.
 
 ## Safety of fetches
 
-- Only `http:` and `https:` URLs are fetched.
-- `localhost`, private, loopback, link-local, CGNAT, benchmarking, multicast and reserved addresses are blocked, including IPv4-mapped IPv6 forms.
-- Every redirect target is checked again before it is followed, and redirects are capped.
-- The address is checked again at connect time, which limits DNS-rebinding attacks.
+The code path is in `scripts/search/content.js`:
+
+1. **Early check, `assertPublicUrl`.** Only `http:` and `https:` URLs. Localhost names and literal private addresses are refused. For a host name, the name is resolved and every record must be public. This check gives a clear early error. It is **not** the protection against DNS rebinding, because the connection does not use its answer.
+2. **Connection, `connectionOptions` and `safeLookup`.** Each request is made with `lookup: safeLookup`. Node calls this option whenever it opens a socket. `safeLookup` resolves the name again and refuses it if any record is private. Node then connects to the address `safeLookup` returned, so the address that is checked is the address that is dialled.
+3. **No reused sockets.** Each request is made with `agent: false`. The default keep-alive agent can reuse a socket without calling `lookup`, which would skip the connect-time check.
+4. **TLS.** For a host name, `servername` is the host name. SNI and the certificate check use the name, never the IP address.
+5. **Redirects.** Each redirect target goes through the same function again: step 1, then step 2 and step 3 for its own connection. Redirects are capped at 3.
+
+Other limits:
+
+- `localhost`, private, loopback, link-local, CGNAT, benchmarking, multicast, reserved and documentation addresses are blocked. The documentation ranges are `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` and `2001:db8::/32`. IPv4-mapped IPv6 forms are classified by their IPv4 address.
+- Each request has a timeout. Each response is capped in size. An oversized response is rejected, not truncated.
 - Page content is capped in size. The browser receives the source list, the findings, and a 280-character excerpt per source. It does not receive the full page text.
+
+What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `fetchRawDocument` code with the DNS lookup and the request function replaced. It shows that: a name that is public during the early check and private at connect time is refused; a redirect to a private address is refused before any request is made; a redirect target that becomes private at connect time is refused; and each request is made with the connect-time lookup and no reused socket. It does not show a real TLS handshake or a real redirect chain on the internet. Those need a live test.
 
 ## Known limitations
 
 - **Live source behaviour is not tested in CI.** DuckDuckGo markup, the CVE Services and NVD responses, and the KEV feed can change. The automated tests use synthetic fixtures and fakes only.
 - The date filter is provider-side and approximate. Dates come only from primary records and read pages.
+- The fetch tests replace DNS and the request function. They show the connect-time check on the code path. They do not show how a real resolver or a real TLS handshake behaves.
+- The citation check cannot tell whether a sentence without an identifier is supported by its citation. It reports that, and does not pass it.
 - Only one search provider exists.
 - A question that names no product gets no product check, and the answer says so.
 - Lowercase product names are not detected as subjects.
@@ -168,13 +201,16 @@ The server does not store the answer text. The result is shown in the Sources pa
 | --- | --- | --- |
 | `scripts/tests/web-research.test.cjs` | Planner, evidence rules, context, the citation check (earlier cases). | Fixtures and fakes |
 | `scripts/tests/web-research-correction.test.cjs` | Broad and named subjects, date ordering and labels, the advisory allowlist, citation check cases. | Fixtures and fakes |
+| `scripts/tests/web-research-provenance.test.cjs` | Citation provenance: a relevant citation, an unrelated one, a wrong product, an exploitation claim cited to the identifier record, and a statement the check cannot check. | Fixtures and fakes |
+| `scripts/tests/web-research-dates.test.cjs` | Both ends of the range, future and malformed dates, unknown dates, explicit "Any time". | Fixtures and fakes |
+| `scripts/tests/web-research-fetch.test.cjs` | The connect-time check, DNS rebinding, redirects, and address classes. The DNS lookup and request function are replaced. No socket is opened. | Fakes (no network) |
 | `scripts/tests/web-research-content.test.cjs` | Address checks, redirects, DuckDuckGo parsing, source tiers. | Fixtures and fakes |
 | `scripts/tests/web-research-route.test.cjs` | The HTTP routes, with the server started on a test port. | Local server |
 
 Run them with:
 
 ```
-node --test scripts/tests/web-research.test.cjs scripts/tests/web-research-content.test.cjs scripts/tests/web-research-route.test.cjs scripts/tests/web-research-correction.test.cjs
+node --test scripts/tests/web-research.test.cjs scripts/tests/web-research-content.test.cjs scripts/tests/web-research-route.test.cjs scripts/tests/web-research-correction.test.cjs scripts/tests/web-research-provenance.test.cjs scripts/tests/web-research-dates.test.cjs scripts/tests/web-research-fetch.test.cjs
 ```
 
 None of these tests calls DuckDuckGo, NVD, CVE Services or CISA. A passing run shows that the rules work on the fixtures. It does not show that the live pipeline works today.
@@ -187,18 +223,18 @@ Live results change over time. Record the question, the date, the date-range cho
 
 1. Start the app and load a text model. Turn on **Web**. Leave the date selector on **Auto dates**. The question contains "latest", so the range should be the past month.
 2. Send the question. In the Sources panel, check:
-   - **Subject term:** no "Subject term" line is shown, because no subject was identified. The Limits list says no product was checked.
-   - **Date range:** the past month, with the dates shown.
+   - **Subject term:** no "Subject term" line is shown, because no subject was identified. Under "Limits of this check" the panel says "No product or entity was named in the question, so no product check was made."
+   - **Date range:** the past month, shown as a date range.
    - **Searches:** a count of searches used out of the maximum. The panel shows counts, not the query text.
    - **Findings:** each has a status, a date label, and an exploitation field. The list is newest first within each status.
-   - **Date labels:** an item published before the range is labelled `published-before-range`, and the answer must not call it a recent discovery. An item with no date is `date-unknown`.
+   - **Dates and notes:** an item published before the range shows the note "Published before the selected date range. Do not describe it as a recent discovery." An item with no established date shows "No publication date could be established, so this cannot be placed in the date range." Each published date shows its source number.
 3. Open two Verified findings. Confirm that the identifier and the product appear in the record or page.
 4. Read the answer. Confirm that:
-   - it does not describe a `published-before-range` or `date-unknown` item as a latest discovery;
+   - it does not describe an item with the note "Published before the selected date range" or "No publication date could be established" as a latest discovery;
    - it does not call anything "actively exploited" unless the finding says *Listed in CISA KEV* or *CISA SSVC decision: exploitation active*;
    - it does not name a product for an item that has no product check.
-5. Check the citation result. It must carry the label "Deterministic consistency check, not a guarantee of truth", and show either "no problems found" with counts or the listed issues. It must show no warning for a claim that a finding does not support.
-6. Set the date selector to **Any time**. The Sources panel must say "Any time (your choice)", with no date range. Ask again. The labels must be `no-date-range`, and the answer must not give a range.
+5. Check the citation result. It must be labelled "Deterministic consistency check", with the note that it is "not a guarantee of truth". It must show either "Citation check: no problems found" with counts, or the listed issues. It must flag any claim that a finding does not support.
+6. Set the date selector to **Any time**. The Sources panel must say "Date range: any time (your choice)". No finding may carry a "before" or "after" note, and the answer must not give a range.
 
 ### B. Specific product: `Is PHP2Shell actively exploited? What are the CVEs?`
 
@@ -206,11 +242,11 @@ Live results change over time. Record the question, the date, the date-range cho
 2. Send the question. In the Sources panel, check:
    - **Subject term:** PHP2Shell.
    - **Findings:** a CVE finding has a status. Each Verified finding names PHP2Shell in its record.
-   - **Exploitation:** *Listed in CISA KEV* only where the KEV feed lists the CVE. A public proof-of-concept is shown as *public proof-of-concept*, not as exploitation.
+   - **Exploitation:** "Listed in CISA KEV (known exploited)" only where the KEV feed lists the CVE. A public proof of concept is shown as "CISA SSVC decision: public proof of concept exists (not exploitation)", not as exploitation.
    - **EUVD:** an EUVD identifier is shown as an EUVD identifier, never as a CVE number. Where an EUVD record names a different product, it is a Conflict.
 3. Open the source link for each Verified CVE. Confirm the identifier and PHP2Shell appear on the page.
-4. Check the answer. Every "actively exploited" statement must be backed by *Listed in CISA KEV* or *CISA SSVC decision: exploitation active*. Every CVE number in the answer must match a finding.
+4. Check the answer. Every "actively exploited" statement must be backed by "Listed in CISA KEV (known exploited)" or "CISA SSVC decision: exploitation active". Every CVE number in the answer must match a finding.
 5. Check the citation result. It must report no invalid citation, and no unconfirmed exploitation claim.
-6. Block `cveawg.mitre.org` (or disconnect the network) and ask again. Each affected CVE must show *Not verified (unavailable)* with a limit listed. The answer must not state its product or its dates.
+6. Block `cveawg.mitre.org` (or disconnect the network) and ask again. Each affected CVE must show the status "Primary record could not be retrieved; not verified", and the Limits list must say that no primary record was retrieved for it. The answer must not present that CVE as verified, or give its publication date as fact.
 
 Each step above is a manual check. None of them has been run by the automated tests.
