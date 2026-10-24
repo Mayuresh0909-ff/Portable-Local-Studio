@@ -473,7 +473,7 @@ export async function chatWithLlm(messages, options = {}) {
       seed: options.seed,
       stop: options.stop,
       useWeb: options.useWeb === true,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
     }),
   });
   const data = await readJsonResponse(res, "The local text model returned an invalid response.");
@@ -504,7 +504,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
       seed: options.seed,
       stop: options.stop,
       useWeb: options.useWeb === true,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
     }),
   };
   if (options.signal) {
@@ -527,6 +527,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
   let timings = null;
   let finishReason = null;
   let webSources = [];
+  let webResearch = null;
 
   const normalizeTextDelta = (value) => {
     if (typeof value === "string") return value;
@@ -563,6 +564,7 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
       const parsed = JSON.parse(data);
       if (eventName === "web_sources") {
         webSources = parsed.sources || [];
+        webResearch = { research: parsed.research || null, findings: parsed.findings || [] };
         return false;
       }
       const choice = parsed.choices?.[0];
@@ -614,7 +616,25 @@ export async function streamChatWithLlm(messages, options = {}, onToken = () => 
 
   if (!finished && buffer.trim()) consumeEvent(buffer);
   if (!content && !reasoningContent) throw new Error("The text model returned an empty streamed response.");
-  return { content, reasoningContent, usage, timings, finishReason, webSources };
+  return { content, reasoningContent, usage, timings, finishReason, webSources, webResearch };
+}
+
+// Checks a finished answer against the web evidence it was given. Returns null if the check cannot run.
+export async function auditWebAnswer(text, webResearch) {
+  try {
+    const res = await fetch("/api/web-research/audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        webResearch: { sources: webResearch?.sources || [], findings: webResearch?.findings || [] },
+      }),
+    });
+    const data = await res.json();
+    return data?.audit || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 export async function searchWeb(query, options = {}) {
@@ -623,7 +643,7 @@ export async function searchWeb(query, options = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       query,
-      timeFilter: options.timeFilter || "any",
+      timeFilter: options.timeFilter || "auto",
       resultLimit: options.resultLimit,
       fetchLimit: options.fetchLimit,
     }),

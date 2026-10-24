@@ -1,0 +1,18 @@
+{
+  "title": "CISA Known Exploited Vulnerabilities Catalog (SYNTHETIC FIXTURE)",
+  "catalogVersion": "synthetic-1",
+  "count": 1,
+  "vulnerabilities": [
+    {
+      "cveID": "CVE-2026-109618",
+      "vendorProject": "Synthetic PHP Project",
+      "product": "PHP2Shell",
+      "vulnerabilityName": "PHP2Shell remote code execution",
+      "dateAdded": "2026-09-05",
+      "shortDescription": "Synthetic entry for testing.",
+      "requiredAction": "Synthetic.",
+      "dueDate": "2026-09-26",
+      "knownRansomwareCampaignUse": "Unknown"
+    }
+  ]
+}

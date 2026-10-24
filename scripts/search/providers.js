@@ -83,15 +83,22 @@ function normalizeTimeFilter(timeFilter) {
   return "";
 }
 
-async function searchDuckDuckGo(query, options = {}) {
-  const limit = Math.max(1, Math.min(10, Number(options.limit) || 5));
+// DuckDuckGo HTML endpoint. The time filter is a coarse, provider-side filter (day, week, month or year).
+// It is not verified per result; the publication date is read from each fetched page instead.
+function buildDuckDuckGoUrl(query, timeFilter) {
   const params = new URLSearchParams({
     q: String(query || "").trim(),
     kl: "us-en",
   });
-  const df = normalizeTimeFilter(options.timeFilter);
+  const df = normalizeTimeFilter(timeFilter);
   if (df) params.set("df", df);
-  const html = await requestText(`https://html.duckduckgo.com/html/?${params.toString()}`);
+  return `https://html.duckduckgo.com/html/?${params.toString()}`;
+}
+
+async function searchDuckDuckGo(query, options = {}) {
+  const limit = Math.max(1, Math.min(10, Number(options.limit) || 5));
+  const fetchText = typeof options.requestText === "function" ? options.requestText : requestText;
+  const html = await fetchText(buildDuckDuckGoUrl(query, options.timeFilter));
   return parseDuckDuckGoHtml(html, limit);
 }
 
@@ -103,4 +110,7 @@ async function webSearch(query, options = {}) {
 
 module.exports = {
   webSearch,
+  buildDuckDuckGoUrl,
+  parseDuckDuckGoHtml,
+  normalizeTimeFilter,
 };

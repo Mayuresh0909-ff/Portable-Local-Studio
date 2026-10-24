@@ -10,7 +10,8 @@ const net      = require("net");
 const os       = require("os");
 const path     = require("path");
 const { spawn, spawnSync, execSync, exec, execFile } = require("child_process");
-const { comprehensiveWebSearch } = require("../search/core");
+const { comprehensiveWebSearch, LIMITS: WEB_RESEARCH_LIMITS } = require("../search/core");
+const { auditAnswer } = require("../search/citation-audit");
 const {
   classifyGpuName,
   vendorFromPciId,
@@ -6698,19 +6699,28 @@ function getLastUserQuery(messages) {
 
 async function augmentMessagesWithWebSearch(messages, body) {
   if (body.useWeb !== true && body.use_web !== true) {
-    return { messages, webSources: [], webContext: "" };
+    return { messages, webSources: [], webContext: "", webResearch: null };
   }
   const query = String(body.webQuery || body.query || getLastUserQuery(messages) || "").trim();
-  if (!query) return { messages, webSources: [], webContext: "" };
+  if (!query) return { messages, webSources: [], webContext: "", webResearch: null };
 
-  const result = await comprehensiveWebSearch(query, {
-    timeFilter: body.timeFilter || body.time_filter || "any",
-    resultLimit: body.webResultLimit || 5,
-    fetchLimit: body.webFetchLimit || 3,
-    cacheDir: WEB_SEARCH_CACHE,
-  });
-  if (!result.context || !result.sources.length) {
-    return { messages, webSources: [], webContext: "" };
+  let result;
+  try {
+    result = await comprehensiveWebSearch(query, {
+      timeFilter: body.timeFilter || body.time_filter || "auto",
+      resultLimit: body.webResultLimit || 5,
+      fetchLimit: body.webFetchLimit || 3,
+      cacheDir: WEB_SEARCH_CACHE,
+    });
+  } catch (err) {
+    // The research pipeline reports its own failures. This guards against anything unexpected, so the chat still runs.
+    console.error("Web research failed:", err);
+    return { messages, webSources: [], webContext: "", webResearch: { research: { error: err.message || String(err) }, findings: [] } };
+  }
+  // The context is inserted even when no source was found, so the model is told that web search returned nothing
+  // and does not answer as if it had checked.
+  if (!result.context) {
+    return { messages, webSources: [], webContext: "", webResearch: null };
   }
   let insertAt = 0;
   while (insertAt < messages.length && messages[insertAt]?.role === "system") {
@@ -6725,6 +6735,7 @@ async function augmentMessagesWithWebSearch(messages, body) {
     messages: augmentedMessages,
     webSources: result.sources,
     webContext: result.context,
+    webResearch: { research: result.research, findings: result.findings },
   };
 }
 
@@ -6794,8 +6805,8 @@ async function doLlmChat(req, res, body, retryCount = 0) {
         const socket = res.socket || res.connection;
         socket?.setNoDelay?.(true);
         res.flushHeaders?.();
-        if (webAugmentation.webSources.length) {
-          res.write(`event: web_sources\ndata: ${JSON.stringify({ sources: webAugmentation.webSources })}\n\n`);
+        if (webAugmentation.webResearch) {
+          res.write(`event: web_sources\ndata: ${JSON.stringify({ sources: webAugmentation.webSources, ...webAugmentation.webResearch })}\n\n`);
         }
         clientRes.on("data", (chunk) => res.write(chunk));
         clientRes.on("end", () => res.end());
@@ -6829,8 +6840,9 @@ async function doLlmChat(req, res, body, retryCount = 0) {
     } else {
       try {
         const result = await requestJson(`http://127.0.0.1:${PORT_LLM}/v1/chat/completions`, JSON.parse(requestData), 300000);
-        if (webAugmentation.webSources.length) {
+        if (webAugmentation.webResearch) {
           result.web_sources = webAugmentation.webSources;
+          result.web_research = webAugmentation.webResearch;
         }
         return json(res, 200, result);
       } catch (err) {
@@ -7039,7 +7051,9 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       provider: "duckduckgo",
       providers: [{ key: "duckduckgo", name: "DuckDuckGo", requiresApiKey: false, active: true }],
       cachePath: WEB_SEARCH_CACHE,
-      defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "any" },
+      defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "auto" },
+      timeFilters: ["auto", "any", "day", "week", "month", "year"],
+      limits: WEB_RESEARCH_LIMITS,
     });
   }
 
@@ -7048,15 +7062,24 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     if (!body) return;
     try {
       const result = await comprehensiveWebSearch(body.query || body.q || "", {
-        timeFilter: body.timeFilter || body.time_filter || "any",
+        timeFilter: body.timeFilter || body.time_filter || "auto",
         resultLimit: body.resultLimit || 5,
         fetchLimit: body.fetchLimit || 3,
         cacheDir: WEB_SEARCH_CACHE,
       });
-      return json(res, 200, { ok: true, ...result });
+      return json(res, 200, { ok: !result.research?.error, ...result });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message || String(err) });
     }
+  }
+
+  // Checks an answer against the research evidence it was given. The answer text is not stored.
+  if (req.url === "/api/web-research/audit" && req.method === "POST") {
+    const body = await readJsonBody(req, res);
+    if (!body) return;
+    const text = String(body.text || "");
+    if (text.length > 200000) return json(res, 413, { ok: false, error: "Answer is too long to audit." });
+    return json(res, 200, { ok: true, audit: auditAnswer(text, body.webResearch || {}) });
   }
 
   if (req.url === "/api/llm/chat" && req.method === "POST") {

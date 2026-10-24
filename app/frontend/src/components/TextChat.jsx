@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Bot, LoaderCircle, Send, Trash2, Square, History, Paperclip, X, ChevronDown, Globe2, Plus } from "lucide-react";
 import {
+  auditWebAnswer,
   getDownloadProgress,
   getLlmStatus,
   listLlmModels,
@@ -8,6 +9,17 @@ import {
   startLlm,
   stopLlm,
 } from "../services/api";
+import WebResearchPanel from "./WebResearchPanel";
+
+// "auto" infers a date range from the question. The other values are the user's explicit choice and are sent unchanged.
+const WEB_TIME_FILTERS = [
+  { value: "auto", label: "Auto dates" },
+  { value: "any", label: "Any time" },
+  { value: "day", label: "Past day" },
+  { value: "week", label: "Past week" },
+  { value: "month", label: "Past month" },
+  { value: "year", label: "Past year" },
+];
 
 const processMessageContent = (rawText, apiReasoning = "", enableThinking = true) => {
   if (typeof rawText !== "string") {
@@ -135,7 +147,7 @@ function TextChat({
   const [input, setInput] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [useWebSearch, setUseWebSearch] = useState(false);
-  const [webTimeFilter, setWebTimeFilter] = useState("any");
+  const [webTimeFilter, setWebTimeFilter] = useState("auto");
   const [loadingModel, setLoadingModel] = useState(null);
   const [tokenUsage, setTokenUsage] = useState({
     prompt_tokens: 0,
@@ -772,6 +784,10 @@ function TextChat({
       };
       
       const processed = processMessageContent(response.content || rawAssistantText || assistantText, response.reasoningContent || assistantReasoning, deepThinkEnabled);
+      // Citation check against the web evidence, when the answer used web search. A failed check is shown as absent.
+      const webAudit = response.webResearch
+        ? await auditWebAnswer(processed.content, { sources: response.webSources || [], findings: response.webResearch.findings || [] })
+        : null;
       const finalMessages = [...nextMessages, {
         role: "assistant",
         content: processed.content,
@@ -779,6 +795,8 @@ function TextChat({
         thinkingDuration: finalThinkingDuration,
         generationStats,
         webSources: response.webSources || [],
+        webResearch: response.webResearch || null,
+        webAudit,
       }];
       setMessages(finalMessages);
       saveConversationState(convId, finalMessages, selectedModel);
@@ -1104,32 +1122,11 @@ function TextChat({
                         </div>
                       )}
                       {message.role === "assistant" && Array.isArray(message.webSources) && message.webSources.length > 0 && (
-                        <div style={{
-                          marginTop: "8px",
-                          padding: "10px 12px",
-                          border: "1px solid var(--border-color)",
-                          borderRadius: "8px",
-                          background: "var(--md-sys-color-surface-container)",
-                          fontSize: "0.8rem",
-                        }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 700, marginBottom: "6px" }}>
-                            <Globe2 size={13} />
-                            <span>Sources</span>
-                          </div>
-                          <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-                            {message.webSources.map((source, sourceIndex) => (
-                              <a
-                                key={`${source.url}-${sourceIndex}`}
-                                href={source.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                style={{ color: "var(--md-sys-color-primary)", textDecoration: "none", overflowWrap: "anywhere" }}
-                              >
-                                [{source.index || sourceIndex + 1}] {source.title || source.url}
-                              </a>
-                            ))}
-                          </div>
-                        </div>
+                        <WebResearchPanel
+                          sources={message.webSources}
+                          webResearch={message.webResearch}
+                          audit={message.webAudit}
+                        />
                       )}
 
                       {/* Generation stats pill */}
@@ -1236,6 +1233,19 @@ function TextChat({
                   <Globe2 size={14} />
                   <span>Web</span>
                 </button>
+                {useWebSearch && (
+                  <select
+                    className="web-time-filter"
+                    aria-label="Web search date range"
+                    value={webTimeFilter}
+                    onChange={(event) => setWebTimeFilter(event.target.value)}
+                    disabled={!status.ready || isBusy}
+                    title="Date range for web search. Auto dates infers a range from words such as latest or today."
+                    style={{ fontSize: "0.75rem", padding: "2px 4px", borderRadius: "6px", border: "1px solid var(--border-color)", background: "transparent", color: "inherit" }}
+                  >
+                    {WEB_TIME_FILTERS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                )}
 
                 {status.ready && supportsThinking && (
                   <button
