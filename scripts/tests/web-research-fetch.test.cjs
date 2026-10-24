@@ -1,13 +1,17 @@
 // Tests for the outbound fetch path: the address a connection uses is the one checked at connect time, redirects are
 // validated again, and private, documentation and IPv4-mapped addresses are refused.
 //
-// EXECUTED: these tests run the real fetchRawDocument code. The DNS lookup (dns.promises.lookup) and the request
-// function (http.get / https.get) are replaced for the duration of each test, and they are restored afterwards.
-// No socket is opened and no name is resolved. The "rebinding" test goes through Node's real connection code: Node
-// calls the lookup option, and the lookup refuses the private record, so the request fails before any connection.
+// WHAT IS MOCKED, AND WHAT IS NOT. Three layers are used, and each test says which one it uses.
+//  1. DNS (dns.promises.lookup): replaced by withDns() in every test that calls it. No name is resolved.
+//  2. The request functions (http.get / https.get): replaced by withRequests() only in the tests that call it. The
+//     fake calls the request's own `lookup` option, the way Node does, so the connect-time check still runs on every
+//     hop. It never opens a socket. Its redirect, size, status and request-option tests are mocked transport tests.
+//  3. The real request path: the "rebinding (real Node request ...)" tests and the two "rebinding:" tests that do not
+//     call withRequests() use Node's real http.get / https.get, with only DNS mocked. In the real-Node test, the test
+//     owns a TCP listener on 127.0.0.1 and counts every connection it accepts, so a refused connect shows as zero.
 //
-// NOT TESTED HERE: a real TLS handshake, a real redirect chain on the internet, and the behaviour of a real DNS
-// server. Those need a live network test in a controlled environment.
+// NOT TESTED HERE: a real TLS handshake, a real redirect chain on the internet, the behaviour of a real DNS server,
+// and any real private-network service. Those need a live test in a controlled environment.
 
 const assert = require("node:assert/strict");
 const dns = require("node:dns").promises;
@@ -89,6 +93,9 @@ async function withRequests(respond, run) {
 
 const bareHostOf = (parsed) => parsed.hostname.replace(/^\[|\]$/g, "");
 
+const REAL_HTTP_GET = http.get;
+const REAL_HTTPS_GET = https.get;
+
 const PUBLIC = "93.184.216.34";
 const PUBLIC_2 = "8.8.8.8";
 
@@ -162,7 +169,38 @@ test("rebinding: the connect-time lookup returns only the validated public recor
 });
 
 // ---------------------------------------------------------------------------------------------------------------
-// Redirects: every target is validated and dialled through the same checked lookup
+// The real request path. Only DNS is mocked: the request goes through Node's own http.get, its own connect code and
+// the lookup option. The test listens on 127.0.0.1 itself and counts every TCP connection it accepts. A refused
+// connect means the count stays at zero.
+// ---------------------------------------------------------------------------------------------------------------
+
+test("rebinding (real Node request, DNS mocked): the connect-time lookup refuses a private record, and the listener accepts no connection", async () => {
+  assert.equal(http.get, REAL_HTTP_GET, "the request function is Node's own, not a fake");
+  let accepted = 0;
+  const listener = net.createServer((socket) => {
+    accepted += 1;
+    socket.destroy();
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const { port } = listener.address();
+  try {
+    // The early check (first lookup) sees a public address. Node's connect-time lookup (second) sees 127.0.0.1.
+    const records = { "rebind-real.example.test": (call) => (call === 1 ? [PUBLIC] : ["127.0.0.1"]) };
+    await withDns(records, async (calls) => {
+      await assert.rejects(fetchRawDocument(`http://rebind-real.example.test:${port}/x`), /Private network addresses are blocked/);
+      assert.equal(calls.length, 2, "the connect-time lookup ran inside Node's request");
+    });
+    // Wait a moment, so that a connection that should not have happened would be counted.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(accepted, 0, "no TCP connection reached the loopback listener");
+  } finally {
+    await new Promise((resolve) => listener.close(resolve));
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Redirects: every target is validated and dialled through the same checked lookup.
+// These tests use the MOCKED transport (withRequests); they do not open a socket.
 // ---------------------------------------------------------------------------------------------------------------
 
 const redirectTo = (location) => () => ({ status: 302, headers: { location, "content-type": "text/html" }, body: "" });

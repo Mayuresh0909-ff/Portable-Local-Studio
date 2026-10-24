@@ -72,7 +72,7 @@ The product, entity or quoted text the question is about is taken from the quest
 - **Question words are not names.** Words such as `Latest`, `Discovered`, `Recent`, `Exploited` and `Cybersecurity` are not subjects. A question made only of such words, such as `What are the latest discovered exploits in cybersecurity?`, has **no subject**.
 - **Identifier-only questions** (`Is CVE-2026-109618 exploited?`) have no subject unless a product is also named.
 
-With no subject, the run still searches, looks up identifiers, and reads pages, within the same limits. No product check is made. The answer and the Limits list say so.
+With no subject, the run still searches, looks up identifiers, and reads pages, within the same limits. The run makes no subject-based product check (`productCheck` is `not-checked`), and the Limits list says no product was named. The citation check still tests every product association in the answer against each finding's own record. See Citation check below.
 
 Lowercase product names (for example `openssl`) are not detected. Write the product name in its usual capitalisation, or put it in quotes.
 
@@ -152,6 +152,7 @@ It works per sentence and per clause:
   - *KEV listing*: the KEV catalogue entry only;
   - *exploitation* (a confirmed status, CISA KEV or SSVC active): the source that establishes that status. **The identifier's own record is not a valid citation for an exploitation claim** unless that record is the source that states it.
   A valid citation number that is unrelated to the claim is reported. If none of a claim's citations supports it, the result is an error. If some do and some do not, the unrelated citation is a warning. Neither is a clean result.
+- **Product association.** A clause that links an identifier with a product is checked against the product names in that identifier's own primary record. This applies whether or not the question named a subject. A claim matches when all its name words appear in the record's product names. Naming a different product is an error (`product-claim-mismatch`). A correct citation to the record does not make the different product correct. A product claim on an identifier with no verified product evidence is reported as unverified (`product-claim-unverified`). It is a warning when the record is verified but names no product, so there is nothing to compare. Negated wording such as "does not affect X" is not a claim. Hedged wording such as "may affect X" is a warning. The check reads words, not meaning. Ambiguous wording, such as "affects the forum software", is reported as not checked, not passed. Product names are never inferred from file names, styles, search snippets or the existence of a citation.
 - A primary record that supports the identifier does not support its exploitation status, severity or affected versions unless it is that field's source.
 - **Limitations, not passes.** The check cannot tell whether a sentence with no identifier is supported by its citation. Those citations are checked for existence only, and the result lists how many there were. A finding with no source fields (an older evidence shape) is also listed under "Not checked", not passed. Statements about identifiers with no citation are listed too.
 - A hedge such as "may", "reportedly" or "not verified" only applies to the segment it sits in, between the last clause boundary (`,` `;` `:` `(` or a contrast word such as "but") and the claim. An earlier hedged mention does not suppress a later unqualified claim.
@@ -160,7 +161,7 @@ It works per sentence and per clause:
 - A public proof-of-concept is not confirmed exploitation.
 - Citation numbers must match a listed source. An identifier with an EUVD number presented as a CVE number is flagged.
 
-It flags: an unverified identifier stated as fact, an unconfirmed exploitation claim, a generic exploitation claim that is not supported, an invalid citation, a citation that does not support its claim, and possible EUVD-as-CVE confusion. It does not judge whether a sentence is true, whether a source is right, or whether the answer covers the question.
+It flags: an unverified identifier stated as fact, a product association that the identifier's record does not support, an unconfirmed exploitation claim, a generic exploitation claim that is not supported, an invalid citation, a citation that does not support its claim, and possible EUVD-as-CVE confusion. It does not judge whether a sentence is true, whether a source is right, or whether the answer covers the question.
 
 The server does not store the answer text. The result is shown in the Sources panel. The panel states the check's name and that it is not a guarantee of truth, and it lists anything the check could not check.
 
@@ -176,21 +177,25 @@ The code path is in `scripts/search/content.js`:
 
 Other limits:
 
-- `localhost`, private, loopback, link-local, CGNAT, benchmarking, multicast, reserved and documentation addresses are blocked. The documentation ranges are `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` and `2001:db8::/32`. IPv4-mapped IPv6 forms are classified by their IPv4 address.
+- `localhost`, private, loopback, link-local, CGNAT, benchmarking, multicast, reserved and documentation IPv4 addresses are blocked. The IPv4 documentation ranges are `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`.
+- **IPv6** uses the policy in `ipv6Policy` in `scripts/search/content.js`. It follows the IANA IPv6 Special-Purpose Address Space registry (last updated 2025-10-09; read 2026-10-24). It is default-deny: an address outside `2000::/3` is blocked. These are blocked: `::/96` (unspecified, loopback, IPv4-compatible); `64:ff9b::/96` (NAT64, always, because the gateway chooses the IPv4 destination, although the registry marks it globally reachable); `64:ff9b:1::/48`; `100::/64`; `100:0:0:1::/64`; `fc00::/7`; `fe80::/10`; `fec0::/10`; `ff00::/8`; `2001:2::/48`; `2001:10::/28`; `2001:db8::/32`; `3fff::/20`; `5f00::/16`; Teredo `2001::/32`; and the rest of `2001::/23`, except the entries the registry marks globally reachable (`2001:1::1`, `2001:1::2`, `2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). 6to4 `2002::/16` is classified by the IPv4 address it embeds. IPv4-mapped IPv6 is classified by the IPv4 address it carries. Ordinary addresses inside `2000::/3`, such as `2606:4700::/32`, are allowed.
+- **Trade-offs.** The registry table was copied by hand, so it must be re-checked when the registry changes. Until then, an address inside `2000::/3` that the registry later marks special-purpose stays allowed. `fec0::/10` and `ff00::/8` are not rows in the registry table. They are blocked under RFC 3879 and RFC 4291. `2001:10::/28` (deprecated ORCHID, terminated 2014) is blocked conservatively, though the table gives no flags for it.
 - Each request has a timeout. Each response is capped in size. An oversized response is rejected, not truncated.
 - Page content is capped in size. The browser receives the source list, the findings, and a 280-character excerpt per source. It does not receive the full page text.
 
-What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `fetchRawDocument` code with the DNS lookup and the request function replaced. It shows that: a name that is public during the early check and private at connect time is refused; a redirect to a private address is refused before any request is made; a redirect target that becomes private at connect time is refused; and each request is made with the connect-time lookup and no reused socket. It does not show a real TLS handshake or a real redirect chain on the internet. Those need a live test.
+What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `fetchRawDocument` code. DNS is replaced in every test. The request function (`http.get` / `https.get`) is replaced only in the tests that use `withRequests`. That is a **mocked transport**. Its fake calls the request's own `lookup` option, as Node does, so the connect-time check runs on every hop, and it never opens a socket. The redirect, size, status and request-option tests use this mocked transport. The DNS-rebinding test named `rebinding (real Node request, DNS mocked)` uses Node's own request function. Its loopback listener is owned by the test, and it counts every connection it accepts. A name that is public during the early check and resolves to `127.0.0.1` at connect time is refused, and no connection reaches the listener. The mocked tests show that a redirect to a private address is refused before any request is made, that a redirect target that becomes private at connect time is refused, and that each request uses the connect-time lookup and no reused socket. Neither set of tests shows a real TLS handshake or a real redirect chain on the internet. Those need a live test.
+
+`scripts/tests/web-research-ipv6.test.cjs` checks the IPv6 policy on address literals only. It resolves no name and opens no socket.
 
 ## Known limitations
 
 - **Live source behaviour is not tested in CI.** DuckDuckGo markup, the CVE Services and NVD responses, and the KEV feed can change. The automated tests use synthetic fixtures and fakes only.
 - The date filter is provider-side and approximate. Dates come only from primary records and read pages.
-- The fetch tests replace DNS and the request function. They show the connect-time check on the code path. They do not show how a real resolver or a real TLS handshake behaves.
+- The fetch tests replace DNS. Most also replace the request function. Only the real-Node rebinding test runs Node's own request code, and it connects only to a loopback listener that the test owns. They do not show how a real resolver or a real TLS handshake behaves.
 - The citation check cannot tell whether a sentence without an identifier is supported by its citation. It reports that, and does not pass it.
 - Only one search provider exists.
-- A question that names no product gets no product check, and the answer says so.
-- Lowercase product names are not detected as subjects.
+- A question that names no product gets no subject-based product check, and the Limits list says so. The citation check still tests product associations in the answer, but only against the names in each finding's own record.
+- Lowercase product names are not detected as subjects. In an answer, a lowercase product name (for example `apache struts`) is reported under Limits as product wording that was not checked. It is not compared, so it is neither a pass nor a mismatch. The citation check reads words, not meaning. A paraphrase or an unusual phrasing can escape it.
 - Secondary sources are read only from the pages the limits allow.
 - A broad question returns the identifiers it can find within the limits. It is not a complete list of recent exploits.
 - The citation check is a text check. It is not a guarantee that an answer is true.
@@ -203,7 +208,9 @@ What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `
 | `scripts/tests/web-research-correction.test.cjs` | Broad and named subjects, date ordering and labels, the advisory allowlist, citation check cases. | Fixtures and fakes |
 | `scripts/tests/web-research-provenance.test.cjs` | Citation provenance: a relevant citation, an unrelated one, a wrong product, an exploitation claim cited to the identifier record, and a statement the check cannot check. | Fixtures and fakes |
 | `scripts/tests/web-research-dates.test.cjs` | Both ends of the range, future and malformed dates, unknown dates, explicit "Any time". | Fixtures and fakes |
-| `scripts/tests/web-research-fetch.test.cjs` | The connect-time check, DNS rebinding, redirects, and address classes. The DNS lookup and request function are replaced. No socket is opened. | Fakes (no network) |
+| `scripts/tests/web-research-product.test.cjs` | Product claims in the answer: the correct product, a different product on a correct CVE record, a wrong product with an unrelated source, a broad question with no subject, ambiguous wording, negation, and hedging. | Fixtures (no network) |
+| `scripts/tests/web-research-fetch.test.cjs` | The connect-time check, DNS rebinding, redirects, and address classes. DNS is replaced. Redirect and size tests use a mocked request function. One rebinding test uses Node's own request code, with a loopback listener that the test owns. | Fakes, plus a test-owned loopback listener (no external network) |
+| `scripts/tests/web-research-ipv6.test.cjs` | IPv6 policy: the special-purpose prefixes, 6to4, Teredo, mapped addresses, spelling variants, and ordinary global addresses. | Address literals (no DNS, no socket) |
 | `scripts/tests/web-research-content.test.cjs` | Address checks, redirects, DuckDuckGo parsing, source tiers. | Fixtures and fakes |
 | `scripts/tests/web-research-route.test.cjs` | The HTTP routes, with the server started on a test port. | Local server |
 

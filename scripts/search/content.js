@@ -40,31 +40,142 @@ function isPrivateIpv4(ip) {
     a >= 224;
 }
 
-// Converts the hex form of an IPv4-mapped address (::ffff:7f00:1) to dotted IPv4.
-function mappedIpv4(value) {
-  const dotted = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (dotted) return dotted[1];
-  const hex = value.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (hex) {
-    const high = parseInt(hex[1], 16);
-    const low = parseInt(hex[2], 16);
-    return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+// IPv6 address classification for the outbound fetcher.
+//
+// The policy follows the IANA IPv6 Special-Purpose Address Space registry (last updated 2025-10-09; read 2026-10-24):
+// https://www.iana.org/assignments/iana-ipv6-special-registry
+// Rows of that table are marked in the list below. fec0::/10 and ff00::/8 are not rows in the table: fec0::/10 is
+// deprecated by RFC 3879 and ff00::/8 is multicast under RFC 4291. Both are blocked on those grounds. 2001:10::/28
+// (deprecated ORCHID, terminated 2014-03) is also blocked here, though the table gives no flags for it.
+//
+// Each address is expanded to eight 16-bit groups before it is compared, so every spelling of the same address
+// (for example 2001:0db8::1 and 2001:db8::1) gets the same answer. The rules, in order:
+//  1. IPv4-mapped (::ffff:0:0/96). Classified by the IPv4 address it carries, as before.
+//  2. ::/96. Blocked. This covers the unspecified and loopback addresses and the deprecated IPv4-compatible form.
+//  3. Explicit blocks, whatever the rest of the address is:
+//     - 64:ff9b::/96 (NAT64, well-known prefix). Blocked entirely, as before. The registry marks it globally
+//       reachable, but the NAT64 gateway, not this fetcher, chooses the IPv4 destination, so it cannot be checked here.
+//     - 64:ff9b:1::/48 (local-use translation), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix),
+//       fc00::/7 (unique-local), fe80::/10 (link-local), fec0::/10 (deprecated site-local), ff00::/8 (multicast),
+//       2001:2::/48 (benchmarking), 2001:10::/28 (deprecated ORCHID), 2001:db8::/32 (documentation),
+//       3fff::/20 (documentation, RFC 9637), 5f00::/16 (SRv6 SIDs, not globally reachable).
+//  4. 6to4 (2002::/16). Classified by the IPv4 address it embeds (bits 16 to 47). Blocked when that address is not public.
+//  5. Teredo (2001::/32). Blocked. The endpoint is hidden behind a relay, so the fetcher cannot check where it leads.
+//  6. IETF protocol assignments (2001::/23). Blocked, as the registry says ("unless allowed by a more specific
+//     allocation"). Allowed only for the entries the registry marks as globally reachable: the anycast services
+//     2001:1::1/128, 2001:1::2/128 and 2001:1::3/128, AMT (2001:3::/32), AS112-v6 (2001:4:112::/48),
+//     ORCHIDv2 (2001:20::/28) and Drone Remote ID (2001:30::/28).
+//  7. Anything outside 2000::/3. Blocked. IANA allocates global unicast addresses only inside 2000::/3.
+//  8. Anything else inside 2000::/3 is allowed. This includes ordinary allocations such as 2606:4700::/32 and
+//     2001:4860::/32.
+//
+// Trade-off: rule 8 allows an address inside 2000::/3 that a later registry change marks as special-purpose,
+// until this list is updated. Rule 7 is a default-deny for everything else. This classifier never fetches anything; it
+// only decides whether an address may be connected to. The registry is copied by hand, so the list must be re-checked
+// when the registry changes. Tests: scripts/tests/web-research-ipv6.test.cjs.
+
+// Expands an IPv6 address to eight 16-bit numbers, or returns null when it is not a valid address. A zone identifier
+// (fe80::1%eth0) is removed first, so the zone cannot change the classification. An embedded IPv4 suffix is converted.
+function ipv6Words(text) {
+  let value = String(text || "").toLowerCase().split("%")[0];
+  if (!net.isIPv6(value)) return null;
+  const dotted = value.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted[2].split(".").map(Number);
+    value = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
   }
-  return null;
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - head.length - tail.length;
+  // "::" stands for one or more groups of zeros. Without "::", all eight groups must be written.
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...new Array(missing).fill("0"), ...tail];
+  if (groups.length !== 8) return null;
+  const numbers = groups.map((group) => parseInt(group, 16));
+  return numbers.every((number) => Number.isInteger(number) && number >= 0 && number <= 0xffff) ? numbers : null;
+}
+
+// Whether the first `bits` bits of an address are the prefix.
+function matchesPrefix(words, prefix, bits) {
+  const expected = ipv6Words(prefix);
+  let remaining = bits;
+  for (let i = 0; i < 8 && remaining > 0; i += 1) {
+    const take = Math.min(16, remaining);
+    const mask = (0xffff << (16 - take)) & 0xffff;
+    if ((words[i] & mask) !== (expected[i] & mask)) return false;
+    remaining -= take;
+  }
+  return true;
+}
+
+// Rules 3 (explicit blocks), 5 and 6 are checked in this order. Each entry is [prefix, bits, reason].
+const IPV6_EXPLICIT_BLOCKS = [
+  ["64:ff9b::", 96, "NAT64 well-known prefix: the gateway chooses the IPv4 destination"],
+  ["64:ff9b:1::", 48, "local-use IPv4/IPv6 translation, not globally reachable"],
+  ["100::", 64, "discard-only block"],
+  ["100:0:0:1::", 64, "dummy IPv6 prefix"],
+  ["fc00::", 7, "unique-local"],
+  ["fe80::", 10, "link-local"],
+  ["fec0::", 10, "deprecated site-local"],
+  ["ff00::", 8, "multicast"],
+  ["2001:2::", 48, "benchmarking"],
+  ["2001:10::", 28, "deprecated ORCHID"],
+  ["2001:db8::", 32, "documentation"],
+  ["3fff::", 20, "documentation"],
+  ["5f00::", 16, "segment routing SIDs, not globally reachable"],
+];
+
+// The more specific entries inside 2001::/23 that the registry marks as globally reachable. Each is [prefix, bits].
+const IPV6_GLOBAL_EXCEPTIONS = [
+  ["2001:1::1", 128], ["2001:1::2", 128], ["2001:1::3", 128],
+  ["2001:3::", 32], ["2001:4:112::", 48], ["2001:20::", 28], ["2001:30::", 28],
+];
+
+// The classification of one IPv6 address: { blocked, reason }. Reasons are for tests and documentation.
+function ipv6Policy(ip) {
+  const words = ipv6Words(ip);
+  if (!words) return { blocked: true, reason: "not a valid IPv6 address" };
+  const ipv4From = (high, low) => [high >> 8, high & 255, low >> 8, low & 255].join(".");
+
+  // 1. IPv4-mapped: the IPv4 address decides.
+  if (words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff) {
+    return { blocked: isPrivateIpv4(ipv4From(words[6], words[7])), reason: "IPv4-mapped: classified by the IPv4 address it carries" };
+  }
+  // 2. ::/96 (unspecified, loopback, deprecated IPv4-compatible).
+  if (words.slice(0, 6).every((word) => word === 0)) {
+    return { blocked: true, reason: "::/96: unspecified, loopback, or deprecated IPv4-compatible" };
+  }
+  // 3. Explicit blocks.
+  for (const [prefix, bits, reason] of IPV6_EXPLICIT_BLOCKS) {
+    if (matchesPrefix(words, prefix, bits)) return { blocked: true, reason };
+  }
+  // 4. 6to4: the embedded IPv4 address decides.
+  if (matchesPrefix(words, "2002::", 16)) {
+    return { blocked: isPrivateIpv4(ipv4From(words[1], words[2])), reason: "6to4: classified by the IPv4 address it embeds" };
+  }
+  // 5. Teredo: blocked, because the endpoint cannot be checked.
+  if (matchesPrefix(words, "2001::", 32)) {
+    return { blocked: true, reason: "Teredo: the endpoint is behind a relay and cannot be checked" };
+  }
+  // 6. IETF protocol assignments: blocked unless listed as globally reachable.
+  if (matchesPrefix(words, "2001::", 23)) {
+    const listed = IPV6_GLOBAL_EXCEPTIONS.some(([prefix, bits]) => matchesPrefix(words, prefix, bits));
+    return listed
+      ? { blocked: false, reason: "listed in the registry as globally reachable" }
+      : { blocked: true, reason: "IETF protocol assignments (2001::/23), not globally reachable unless listed" };
+  }
+  // 7. Outside the global unicast space: blocked.
+  if ((words[0] & 0xe000) !== 0x2000) {
+    return { blocked: true, reason: "outside 2000::/3, the global unicast space" };
+  }
+  // 8. Everything else inside 2000::/3 is an ordinary allocation.
+  return { blocked: false, reason: "globally routable unicast" };
 }
 
 function isPrivateIpv6(ip) {
-  const value = String(ip || "").toLowerCase();
-  const mapped = mappedIpv4(value);
-  if (mapped) return isPrivateIpv4(mapped);
-  if (value.startsWith("::ffff:") || value.startsWith("64:ff9b::")) return true;
-  const first = parseInt(value.split(":")[0] || "0", 16);
-  return value === "::1" ||
-    value === "::" ||
-    value.startsWith("2001:db8:") ||                  // documentation range 2001:db8::/32
-    (first & 0xfe00) === 0xfc00 ||   // fc00::/7 unique local
-    (first & 0xffc0) === 0xfe80 ||   // fe80::/10 link local
-    (first & 0xff00) === 0xff00;     // ff00::/8 multicast
+  return ipv6Policy(ip).blocked;
 }
 
 function isPrivateIp(ip) {
@@ -260,6 +371,8 @@ module.exports = {
   isPrivateIp,
   isPrivateIpv4,
   isPrivateIpv6,
+  ipv6Policy,
+  ipv6Words,
   stripHtml,
   MAX_REDIRECTS,
 };
