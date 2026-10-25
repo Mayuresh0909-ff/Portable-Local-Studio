@@ -132,11 +132,13 @@ function hasProvenance(finding) {
 // A source index as the research run numbers sources: a positive whole number, counting from 1. Missing, empty, boolean,
 // fractional, zero and negative values are not indexes. Number(null) and Number("") are both 0, so they are rejected
 // before any conversion. The result is null when the value is not an index.
+// A string of very many digits converts to Infinity, which is not an index. Number.isSafeInteger rejects Infinity and
+// any value beyond 2^53 - 1, so such a string is not an index.
 function sourceIndexOf(value) {
-  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0 ? value : null;
   if (typeof value === "string" && /^\d+$/.test(value.trim())) {
     const number = Number(value.trim());
-    return number > 0 ? number : null;
+    return Number.isSafeInteger(number) && number > 0 ? number : null;
   }
   return null;
 }

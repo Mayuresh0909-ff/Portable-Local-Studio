@@ -259,3 +259,28 @@ test("exploitation source: a valid source index still supports the claim (legiti
   const kev = auditAnswer(`CVE-2026-109618 is in the CISA KEV catalogue [${f1.kev}].`, f1.evidence);
   assert.equal(kev.ok, true, JSON.stringify(kev.issues));
 });
+
+// --- Overlong digit-only source values: Number() of a very long digit string is Infinity, which is not an index ------
+
+for (const [label, source] of [
+  ["a 400-digit string (Number() is Infinity)", "9".repeat(400)],
+  ["a 16-digit string beyond the safe integer range", "9999999999999999"],
+  ["the first unsafe integer, as a string", "9007199254740993"],
+]) {
+  test(`exploitation source: ${label} is reported as unavailable, and an exploitation claim cannot pass on it`, async () => {
+    const f1 = await facts();
+    const evidence = withExploitationSource(f1.evidence, source); // replaces only the source value
+    const result = auditAnswer(`CVE-2026-109618 is actively exploited [${f1.kev}].`, evidence);
+    assert.equal(result.ok, false, JSON.stringify(result.issues));
+    assert.ok(types(result).includes("exploitation-source-unavailable"), JSON.stringify(result.issues));
+    const issue = result.issues.find((item) => item.type === "exploitation-source-unavailable");
+    assert.doesNotMatch(issue.detail, /Infinity/, "the detail does not present Infinity as a source");
+  });
+}
+
+test("exploitation source: a valid index written as a string still supports the claim (unchanged behaviour)", async () => {
+  const f1 = await facts();
+  const evidence = withExploitationSource(f1.evidence, String(f1.kev));
+  const result = auditAnswer(`CVE-2026-109618 is actively exploited [${f1.kev}].`, evidence);
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+});
