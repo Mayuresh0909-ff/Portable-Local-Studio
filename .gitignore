@@ -47,3 +47,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# GPU evidence captured by scripts/capture-gpu-evidence.cjs (local, not committed)
+gpu-evidence/

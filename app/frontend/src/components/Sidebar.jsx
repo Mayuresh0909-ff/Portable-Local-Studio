@@ -1,5 +1,5 @@
 import React, { memo } from "react";
-import { Image, FolderDown, MessageSquare, Mic, Settings, Shield, Terminal, ChevronDown, ChevronUp, Trash2, Volume2 } from "lucide-react";
+import { Image, FolderDown, MessageSquare, Mic, Settings, Shield, Terminal, ChevronDown, ChevronUp, Trash2, Volume2, RefreshCw } from "lucide-react";
 
 function formatSidebarDate(value) {
   const date = new Date(value);
@@ -14,6 +14,9 @@ function Sidebar({
   activeTab, 
   setActiveTab, 
   specs,
+  onRefreshSpecs,
+  isRefreshingSpecs = false,
+  canRefreshSpecs = true,
   conversations = [],
   activeConversationId,
   setActiveConversationId,
@@ -429,17 +432,27 @@ function Sidebar({
         </div>
       </div>
 
-      {/* Sidebar Footer with Host Telemetry System Specs */}
+      {/* Host inventory. This is not necessarily the device currently running inference. */}
       <div className="sidebar-footer">
-        <div className="sidebar-specs-header">
+        <div className="sidebar-specs-header" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
           <Terminal size={12} />
           <span>Host Specifications</span>
+          <button
+            type="button"
+            onClick={onRefreshSpecs}
+            disabled={!canRefreshSpecs || isRefreshingSpecs}
+            title={!canRefreshSpecs ? "Stop the active image/text model before refreshing hardware detection" : "Refresh detected hardware"}
+            aria-label="Refresh detected hardware"
+            style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "2px", border: 0, background: "transparent", color: "var(--md-sys-color-primary)", cursor: canRefreshSpecs && !isRefreshingSpecs ? "pointer" : "not-allowed", opacity: canRefreshSpecs && !isRefreshingSpecs ? 1 : 0.45 }}
+          >
+            <RefreshCw size={12} className={isRefreshingSpecs ? "progress-spinner" : ""} />
+          </button>
         </div>
         <div className="sidebar-specs-item" title={specs.cpu_name}>
           CPU: {specs.cpu_name}
         </div>
-        <div className="sidebar-specs-item" title={specs.gpu_name}>
-          GPU: {specs.gpu_name}
+        <div className="sidebar-specs-item" title={"Detected host GPU; not necessarily the device currently running inference. " + specs.gpu_name}>
+          Primary detected GPU: {specs.gpu_name}
         </div>
         <div className="sidebar-specs-item">
           Memory: {specs.ram_total_gb.toFixed(0)} GB RAM ({specs.cpu_cores_physical} Cores)

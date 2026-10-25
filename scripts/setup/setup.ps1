@@ -191,6 +191,29 @@ function Expand-WithProgress {
     Write-Host ""
 }
 
+function Assert-FileSha256 {
+    param([string]$Path, [string]$ExpectedSha256, [string]$Label)
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "No pinned SHA-256 is configured for $Label. Refusing to use an unverified download."
+    }
+    Print-Info "Verifying SHA-256: $Label"
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 mismatch for $Label. Expected $ExpectedSha256 but got $actual. The download was deleted and was not extracted or run. Re-run setup; if it fails again, the upstream release asset may have changed."
+    }
+    Print-OK "SHA-256 verified: $Label"
+}
+
+# Pinned SHA-256 digests for the release assets downloaded below. Source: the
+# GitHub release-asset metadata (api.github.com/repos/<owner>/<repo>/releases/tags/<tag>)
+# of the upstream repositories leejet/stable-diffusion.cpp. Update these together with the URLs.
+$sdCpuSha256    = "38da3539d3af6918f4c218fd198ac6e26cd71249e54feb3a491d184d3ca94ea0"  # master-782-b290693 sd-master-b290693-bin-win-cpu-x64.zip
+$sdCudaSha256   = "bc7aa2f6d471b324bfbc76f108a5cb3b76de29cb892d12609647e11b041f8a02"  # master-782-b290693 sd-master-b290693-bin-win-cuda12-x64.zip
+$sdCudartSha256 = "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d"  # master-782-b290693 cudart-sd-bin-win-cu12-x64.zip
+$sdVulkanSha256 = "7a0c0a9c3f5a23079174e6f18965177077faeaa7745fcf03c1fc81ae995c14be"  # master-685-19bdfe2 sd-master-19bdfe2-bin-win-vulkan-x64.zip
+
 function Ensure-VisualCppRuntime {
     $requiredDlls = @(
         "VCRUNTIME140.dll",
@@ -250,68 +273,198 @@ $steps = 8
 # ── Step 1: Portable Node.js ──────────────────────────────────────────────────
 Print-Step 1 $steps "Setting up portable Node.js (app/tools/node-win/)"
 
-$nodeReady = $false
-if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
+$expectedNodeVersion = "v22.23.3"
+# SHA-256 of node-v22.23.3-win-x64.zip from the official Node.js SHASUMS256.txt for v22.23.3, as supplied by the maintainer.
+# Not re-fetched from nodejs.org in the build sandbox; see docs/setup-download-pins.md.
+$nodeZipSha256 = "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71"
+
+# Win32 MAX_PATH is 260 including the terminating NUL, so a path may be at most 259 characters.
+$nodeMaxPathLength = 259
+
+# Measures the longest path the Node.js archive would produce under TEMP (extraction) and under
+# the staging folder (copy into the project). Reads only the zip directory: nothing is extracted.
+function Get-NodeArchivePathLengths {
+    param([string]$ZipPath, [string]$ExtractRoot, [string]$StageRoot)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $topFolder  = "node-v22.23.3-win-x64/"
+    $extractMax = 0
+    $stageMax   = 0
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
-        $v = & $nodeExe --version
-        # Test if npm is functional (doesn't throw parsing/unexpected token errors)
-        $npmTest = & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") --version 2>&1
-        if ($LASTEXITCODE -eq 0 -and $npmTest -match "^\d+\.\d+\.\d+") {
-            $nodeReady = $true
-            Print-OK "Portable Node.js already ready: $v"
+        foreach ($entry in $zip.Entries) {
+            $extractLen = $ExtractRoot.Length + 1 + $entry.FullName.Length
+            if ($extractLen -gt $extractMax) { $extractMax = $extractLen }
+
+            $relative = $entry.FullName
+            if ($relative.StartsWith($topFolder)) { $relative = $relative.Substring($topFolder.Length) }
+            $stageLen = $StageRoot.Length + 1 + $relative.Length
+            if ($stageLen -gt $stageMax) { $stageMax = $stageLen }
         }
-    } catch {}
+    } finally {
+        $zip.Dispose()
+    }
+    return [pscustomobject]@{ ExtractMax = $extractMax; StageMax = $stageMax }
 }
 
+function Test-PortableNodeRuntime {
+    param([string]$ExpectedVersion, [string]$Dir = $nodeDir)
+
+    $exe = Join-Path $Dir "node.exe"
+
+    try {
+        $nodeVersion = (& $exe --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne $ExpectedVersion) {
+            return $false
+        }
+
+        # npm --version can succeed even when npm's bundled dependency tree is broken.
+        # cache verify loads npm's cache modules without installing project packages.
+        $smokeCache = Join-Path $env:TEMP ("pls-npm-smoke-" + [Guid]::NewGuid().ToString("N"))
+        $npmExitCode = 1
+        try {
+            & $exe (Join-Path $Dir "node_modules\npm\bin\npm-cli.js") cache verify --cache $smokeCache --loglevel=error *> $null
+            $npmExitCode = $LASTEXITCODE
+        } finally {
+            Remove-Item $smokeCache -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        return ($npmExitCode -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+$nodeReady = $false
+if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
+    $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
+    if (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion) {
+        $nodeReady = $true
+        Print-OK "Portable Node.js and npm already ready: $v"
+    } else {
+        Print-Warn "Portable Node.js/npm is outdated or failed the npm runtime check. Reinstalling..."
+    }
+}
+
+# The active runtime is never deleted before a replacement has been downloaded, extracted,
+# copied into a staging folder, and validated. Only then is it swapped in by rename.
+$nodeStagingDir  = "$nodeDir.staging"
+$nodePreviousDir = "$nodeDir.previous"
+$nodeLeaf        = Split-Path -Leaf $nodeDir
+$nodePreviousLeaf = Split-Path -Leaf $nodePreviousDir
+
 if (-not $nodeReady) {
+    # Recover from an interrupted earlier swap: restore a set-aside copy if the active one is gone.
+    if (-not (Test-Path $nodeDir) -and (Test-Path $nodePreviousDir)) {
+        Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf
+    }
+    # Leftovers from an interrupted attempt are safe to remove. The active runtime is not.
+    Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $nodeDir) {
-        Print-Warn "Portable Node.js installation is corrupted or incomplete. Cleaning up..."
-        Remove-Item $nodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $nodePreviousDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Warn "Replacing the Portable Node.js runtime. The current copy is kept until the new one validates."
     }
 
     $nodeZip = Join-Path $toolsDir "node.zip"
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
     $ok = Invoke-RichDownload `
-        -Url  "https://nodejs.org/dist/v22.12.0/node-v22.12.0-win-x64.zip" `
+        -Url  "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip" `
         -Dest $nodeZip `
-        -Label "Node.js v22.12.0 LTS (Portable ZIP)"
+        -Label "Node.js v22.23.3 LTS (Portable ZIP)"
 
-    if (-not $ok) { Print-Fail "Cannot download Node.js."; Read-Host; exit 1 }
+    if (-not $ok) { Print-Fail "Cannot download Node.js. The existing runtime (if any) was kept."; Read-Host; exit 1 }
 
-    Expand-WithProgress -ZipPath $nodeZip -Destination $toolsDir -Label "Node.js"
-    Remove-Item $nodeZip -Force
-
-    $extracted = Get-ChildItem $toolsDir -Directory | Where-Object { $_.Name -like "node-v*" } | Select-Object -First 1
-    if ($extracted) {
-        if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
-        Rename-Item $extracted.FullName "node-win"
-    }
-
-    # Pause briefly to allow USB drive writes to flush
-    Print-Info "Waiting for disk to flush..."
-    Start-Sleep -Seconds 3
-
-    # Re-verify
-    $nodeReady = $false
-    if ((Test-Path $nodeExe) -and (Test-Path $npmCmd)) {
-        try {
-            $v = & $nodeExe --version
-            $npmTest = & $nodeExe (Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js") --version 2>&1
-            if ($LASTEXITCODE -eq 0 -and $npmTest -match "^\d+\.\d+\.\d+") {
-                $nodeReady = $true
-            }
-        } catch {}
-    }
-
-    if (-not $nodeReady) {
-        Print-Fail "Portable Node.js install is incomplete or corrupted. Close any running Uncensored AI Studio windows, delete app/tools/node-win, then run setup again."
+    # Verify the archive before anything is extracted or run. On mismatch, Assert-FileSha256
+    # deletes the archive and throws; the existing runtime is not touched.
+    try {
+        Assert-FileSha256 -Path $nodeZip -ExpectedSha256 $nodeZipSha256 -Label "Node.js v22.23.3 Windows x64 ZIP"
+    } catch {
+        Print-Fail $_.Exception.Message
+        Print-Fail "The existing Portable Node.js runtime was kept. Re-run setup to download the archive again."
         Read-Host; exit 1
     }
 
+    # Extract under TEMP first: npm's deeply nested package paths can exceed the traditional
+    # 260-character limit when extracted under a deep project path.
+    $nodeExtractRoot = Join-Path $env:TEMP ("pls-node-extract-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        # Path-length guard: decide from the zip directory before extracting or copying anything.
+        $pathLengths = Get-NodeArchivePathLengths -ZipPath $nodeZip -ExtractRoot $nodeExtractRoot -StageRoot $nodeStagingDir
+        if ($pathLengths.StageMax -gt $nodeMaxPathLength) {
+            throw ("The Node.js runtime would need a {0}-character path inside app\tools (limit {1}), which Windows may refuse. Move the Portable-Local-Studio folder to a shorter location, for example C:\PLS, then run setup again. Nothing was copied into the project." -f $pathLengths.StageMax, $nodeMaxPathLength)
+        }
+        if ($pathLengths.ExtractMax -gt $nodeMaxPathLength) {
+            throw ("Extracting Node.js under your TEMP folder would need a {0}-character path (limit {1}). Create a short folder such as C:\Temp, then in the same command prompt run: set TEMP=C:\Temp and set TMP=C:\Temp, and start windows.bat again. Windows system settings were not changed." -f $pathLengths.ExtractMax, $nodeMaxPathLength)
+        }
+
+        Expand-WithProgress -ZipPath $nodeZip -Destination $nodeExtractRoot -Label "Node.js"
+
+        $extracted = Get-ChildItem $nodeExtractRoot -Directory |
+            Where-Object { $_.Name -eq "node-v22.23.3-win-x64" } |
+            Select-Object -First 1
+        if (-not $extracted) {
+            throw "The Node.js ZIP did not contain the expected node-v22.23.3-win-x64 directory."
+        }
+
+        # Copy into a staging folder beside the active runtime. Copy-Item errors are terminating
+        # here, so a partial copy cannot be mistaken for a complete runtime.
+        New-Item -ItemType Directory -Force -Path $nodeStagingDir | Out-Null
+        Get-ChildItem -LiteralPath $extracted.FullName -Force |
+            Copy-Item -Destination $nodeStagingDir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "Could not stage Node.js: $($_.Exception.Message)"
+        if (Test-Path $nodeDir) { Print-Fail "The existing Portable Node.js runtime was kept." }
+        Read-Host; exit 1
+    } finally {
+        Remove-Item $nodeExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $nodeZip -Force -ErrorAction SilentlyContinue
+    }
+
+    # Validate the staged copy before it touches the active runtime.
+    $stagedExe = Join-Path $nodeStagingDir "node.exe"
+    $stagedNpm = Join-Path $nodeStagingDir "npm.cmd"
+    $stagedOk = ((Test-Path $stagedExe) -and (Test-Path $stagedNpm) -and (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion -Dir $nodeStagingDir))
+    if (-not $stagedOk) {
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "The downloaded Node.js runtime failed validation (version or npm check). The existing runtime (if any) was kept."
+        Read-Host; exit 1
+    }
+
+    # Swap by rename. If activation fails, put the previous copy back.
+    try {
+        if (Test-Path $nodeDir) {
+            Rename-Item -LiteralPath $nodeDir -NewName $nodePreviousLeaf
+        }
+        Rename-Item -LiteralPath $nodeStagingDir -NewName $nodeLeaf
+    } catch {
+        if (-not (Test-Path $nodeDir) -and (Test-Path $nodePreviousDir)) {
+            Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $nodeStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        Print-Fail "Could not activate the new Node.js runtime: $($_.Exception.Message)"
+        Print-Fail "Close any running Uncensored AI Studio windows (a running node.exe can lock app/tools/node-win), then run setup again."
+        Read-Host; exit 1
+    }
+
+    # Pause briefly to allow disk writes to flush
+    Print-Info "Waiting for disk to flush..."
+    Start-Sleep -Seconds 1
+
+    # Re-verify the activated runtime. Restore the previous copy if it fails.
+    $v = (& $nodeExe --version 2>&1 | Out-String).Trim()
+    $nodeReady = (Test-Path $nodeExe) -and (Test-Path $npmCmd) -and (Test-PortableNodeRuntime -ExpectedVersion $expectedNodeVersion)
+    if (-not $nodeReady) {
+        Remove-Item -LiteralPath $nodeDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $nodePreviousDir) { Rename-Item -LiteralPath $nodePreviousDir -NewName $nodeLeaf -ErrorAction SilentlyContinue }
+        Print-Fail "Portable Node.js failed validation after activation. The previous runtime was restored where available."
+        Read-Host; exit 1
+    }
+
+    Remove-Item -LiteralPath $nodePreviousDir -Recurse -Force -ErrorAction SilentlyContinue
     Print-OK "Portable Node.js ready: $v"
 }
-
 try {
     Ensure-VisualCppRuntime
 } catch {
@@ -359,6 +512,7 @@ if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll) -and ($installedC
         -Label "stable-diffusion.cpp CPU Backend (Windows x64, runtime dispatch)"
 
     if (-not $ok) { Print-Fail "Cannot download CPU backend binaries."; Read-Host; exit 1 }
+    Assert-FileSha256 -Path $cpuBackendZip -ExpectedSha256 $sdCpuSha256 -Label "stable-diffusion.cpp CPU backend (master-782-b290693)"
 
     $tempExt = Join-Path $toolsDir "sd-cpu-temp"
     Expand-WithProgress -ZipPath $cpuBackendZip -Destination $tempExt -Label "CPU Backend"
@@ -416,6 +570,14 @@ if ($hasNvidia) {
             -Dest $backendZip `
             -Label "stable-diffusion.cpp CUDA 12.8 Backend (Windows x64)"
 
+        if ($ok) {
+            try {
+                Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdCudaSha256 -Label "stable-diffusion.cpp CUDA 12.8 backend (master-782-b290693)"
+            } catch {
+                Print-Warn $_.Exception.Message
+                $ok = $false
+            }
+        }
         if (-not $ok) {
             Print-Warn "Cannot download CUDA backend binaries. Continuing with the Vulkan backend fallback."
         } else {
@@ -467,6 +629,14 @@ if ($hasNvidia) {
                 -Label "CUDA 12.8 Runtime DLLs (stable-diffusion.cpp)"
 
             if ($ok) {
+                try {
+                    Assert-FileSha256 -Path $dllZip -ExpectedSha256 $sdCudartSha256 -Label "CUDA 12.8 runtime DLLs (master-782-b290693)"
+                } catch {
+                    Print-Warn $_.Exception.Message
+                    $ok = $false
+                }
+            }
+            if ($ok) {
                 Expand-WithProgress -ZipPath $dllZip -Destination $backendDest -Label "CUDA Runtime DLLs"
                 Remove-Item $dllZip -Force
                 Print-OK "CUDA runtime DLLs set up successfully!"
@@ -505,6 +675,7 @@ if ($hasNvidia) {
             -Label "stable-diffusion.cpp Vulkan Backend (Windows x64)"
 
         if (-not $ok) { Print-Fail "Cannot download Vulkan backend binaries."; Read-Host; exit 1 }
+        Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdVulkanSha256 -Label "stable-diffusion.cpp Vulkan backend (master-685-19bdfe2)"
 
         $tempExt = Join-Path $toolsDir "sd-vulkan-temp"
         Expand-WithProgress -ZipPath $backendZip -Destination $tempExt -Label "Vulkan Backend"
@@ -560,6 +731,7 @@ if ($hasNvidia) {
             -Label "stable-diffusion.cpp Vulkan Backend (Windows x64)"
 
         if (-not $ok) { Print-Fail "Cannot download Vulkan backend binaries."; Read-Host; exit 1 }
+        Assert-FileSha256 -Path $backendZip -ExpectedSha256 $sdVulkanSha256 -Label "stable-diffusion.cpp Vulkan backend (master-685-19bdfe2)"
 
         $tempExt = Join-Path $toolsDir "sd-vulkan-temp"
         Expand-WithProgress -ZipPath $backendZip -Destination $tempExt -Label "Vulkan Backend"
@@ -611,11 +783,14 @@ if (-not $?) {
     Read-Host; exit 1
 }
 
-Print-Step 5 $steps "Setting up Kokoro ONNX text-to-speech runtime"
-& (Join-Path $scriptDir "setup-tts.ps1")
-if (-not $?) {
-    Print-Fail "Kokoro TTS setup failed."
-    Read-Host; exit 1
+Print-Step 5 $steps "Setting up optional Kokoro ONNX text-to-speech runtime"
+try {
+    & (Join-Path $scriptDir "setup-tts.ps1")
+    if (-not $?) {
+        Print-Warn "Kokoro TTS setup failed. Continuing without text-to-speech; image and text features can still be tested."
+    }
+} catch {
+    Print-Warn "Kokoro TTS setup failed. Continuing without text-to-speech. $($_.Exception.Message)"
 }
 
 $npu = Get-IntelOpenVinoNpu

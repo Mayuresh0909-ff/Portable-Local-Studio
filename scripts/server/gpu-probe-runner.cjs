@@ -1,0 +1,102 @@
+// gpu-probe-runner.cjs — the process-facing GPU helpers shared by serve.cjs and
+// scripts/capture-gpu-evidence.cjs: the nvidia-smi query and the spawn of one backend probe.
+//
+// Parsing and decisions stay in gpu-selection.cjs. This file only runs commands and returns their
+// raw results. Callers may pass `run` / `spawn` to replace spawnSync in tests.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { parseNvidiaSmiCsv, findFirstErrorLine } = require("./gpu-selection.cjs");
+
+// Queries are tried in order. A driver that rejects a field name falls through to the next query.
+// The first query adds driver_version and compute_cap (compute capability, e.g. 12.0 for the
+// RTX 5060). A driver that knows driver_version but not compute_cap keeps the driver version in the
+// second query. Older drivers reject those names and use the shorter queries.
+const NVIDIA_SMI_QUERIES = [
+  "index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version,compute_cap",
+  "index,name,memory.total,memory.free,display_active,pci.bus_id,driver_version",
+  "index,name,memory.total,memory.free,display_active,pci.bus_id",
+  "index,name,memory.total,memory.free", // older drivers do not know display_active
+];
+
+function nvidiaSmiCommands(platform) {
+  return platform === "win32"
+    ? ["nvidia-smi", "C:\\Windows\\System32\\nvidia-smi.exe", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe"]
+    : ["nvidia-smi", "/usr/bin/nvidia-smi"];
+}
+
+// Returns { ok, devices, error, command?, attempts }. Never throws. `attempts` lists every query
+// that was run, in order, with its raw stdout and stderr, so a rejected field is visible in evidence.
+function queryNvidiaSmi({
+  platform = process.platform,
+  spawn = spawnSync,
+  exists = fs.existsSync,
+  queries = NVIDIA_SMI_QUERIES,
+} = {}) {
+  if (platform === "darwin") {
+    return { ok: false, devices: [], error: "NVIDIA tools are not used on macOS.", attempts: [] };
+  }
+  const attempts = [];
+  let lastError = "nvidia-smi was not found";
+  for (const command of nvidiaSmiCommands(platform)) {
+    if (path.isAbsolute(command) && !exists(command)) continue;
+    for (const fields of queries) {
+      const result = spawn(command, [`--query-gpu=${fields}`, "--format=csv,noheader,nounits"], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      });
+      attempts.push({
+        command,
+        query: fields,
+        exitCode: result.status === undefined ? null : result.status,
+        errorCode: result.error ? (result.error.code || "ERROR") : null,
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
+      });
+      if (result.error) {
+        lastError = result.error.code === "ENOENT"
+          ? "nvidia-smi was not found"
+          : `nvidia-smi failed (${result.error.code || result.error.message})`;
+        break;
+      }
+      const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+      if (result.status !== 0) {
+        lastError = findFirstErrorLine(output) || `nvidia-smi exited with code ${result.status}`;
+        if (/not a valid field|invalid field/i.test(output)) continue;
+        break;
+      }
+      const devices = parseNvidiaSmiCsv(result.stdout);
+      if (devices.length) return { ok: true, devices, error: null, command, attempts };
+      lastError = "nvidia-smi reported no NVIDIA GPUs";
+      break;
+    }
+  }
+  return { ok: false, devices: [], error: lastError, attempts };
+}
+
+// Spawns one backend probe. Returns { output, stdout, stderr, exitCode, errorCode, timedOut }.
+// `output` stays the combined text the classifiers read. stdout and stderr are kept apart for evidence.
+function runBackendProbeProcess(binaryPath, args, options) {
+  const result = spawnSync(binaryPath, args, options);
+  const stdout = String(result.stdout || "");
+  const stderr = String(result.stderr || "");
+  const errorCode = result.error ? (result.error.code || "ERROR") : null;
+  return {
+    output: `${stdout}\n${stderr}`,
+    stdout,
+    stderr,
+    exitCode: result.status,
+    errorCode,
+    timedOut: errorCode === "ETIMEDOUT",
+  };
+}
+
+module.exports = {
+  NVIDIA_SMI_QUERIES,
+  nvidiaSmiCommands,
+  queryNvidiaSmi,
+  runBackendProbeProcess,
+};

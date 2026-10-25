@@ -12,8 +12,10 @@ import {
   getLlmStatus,
   listLlmModels,
   startLlm,
-  chatWithLlm
+  chatWithLlm,
+  inspectModelFile
 } from "../services/api";
+import { describeGenerationFailure } from "../services/generationFailure.js";
 
 const GalleryItem = memo(({ img, idx, isSelected, onClick }) => {
   const handleClick = (e) => {
@@ -68,6 +70,9 @@ function Generator({
   const [isRestartingBackend, setIsRestartingBackend] = useState(false);
   const [restartLoadProgress, setRestartLoadProgress] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [generationFailure, setGenerationFailure] = useState(null);
+  const [modelWarnings, setModelWarnings] = useState([]);
+  const [modelCompatibility, setModelCompatibility] = useState([]);
   const [isDecoding, setIsDecoding] = useState(false);
   const [selectedGalleryIndexes, setSelectedGalleryIndexes] = useState([]);
   const [baseImage, setBaseImage] = useState(null);
@@ -153,6 +158,23 @@ function Generator({
     }
   }, [constraints.backendType]);
 
+  // Header check for the selected model. Shows warnings only; it never blocks generation.
+  React.useEffect(() => {
+    let cancelled = false;
+    const fileName = activeModel ? activeModel.split(/[\\/]/).pop() : "";
+    if (!/\.safetensors$/i.test(fileName)) {
+      setModelWarnings([]);
+      setModelCompatibility([]);
+      return undefined;
+    }
+    inspectModelFile(fileName).then((report) => {
+      if (cancelled) return;
+      setModelWarnings(report && Array.isArray(report.warnings) ? report.warnings : []);
+      setModelCompatibility(report && Array.isArray(report.compatibility) ? report.compatibility : []);
+    });
+    return () => { cancelled = true; };
+  }, [activeModel]);
+
   const handleBaseImageSelect = (e) => {
     const file = e.target.files?.[0];
     e.target.value = "";
@@ -174,6 +196,7 @@ function Generator({
     if (!prompt.trim()) return;
 
     setErrorMsg(null);
+    setGenerationFailure(null);
     setIsRestartingBackend(true);
     setRestartLoadProgress(null);
 
@@ -483,6 +506,11 @@ function Generator({
       } else {
         console.error("Generation failed:", e);
         setErrorMsg(e.message || "Generation failed. Please try again.");
+        setGenerationFailure(describeGenerationFailure({
+          category: e.category || "unknown",
+          message: e.message,
+          raw: e.raw || e.message,
+        }));
       }
       if (timerRef.current) clearInterval(timerRef.current);
     } finally {
@@ -796,6 +824,28 @@ function Generator({
                 </div>
               </div>
 
+              {modelWarnings.length > 0 && (
+                <div role="status" style={{ marginTop: "8px", fontSize: "0.85rem", color: "var(--md-sys-color-error)" }}>
+                  {modelWarnings.map((warning) => (
+                    <div key={warning}>{warning}</div>
+                  ))}
+                </div>
+              )}
+
+              {modelCompatibility.length > 0 && (
+                <div role="note" style={{ marginTop: "6px", fontSize: "0.85rem" }}>
+                  <div style={{ fontWeight: 600 }}>Compatibility check (does not block Generate)</div>
+                  {modelCompatibility.map((item) => (
+                    <div key={item.setting} style={{ marginTop: "4px" }}>
+                      <div>{item.message}</div>
+                      <div style={{ opacity: 0.8, fontSize: "0.8rem" }}>
+                        Setting: {item.setting}. Evidence: {(item.evidence || []).join("; ")}.
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* Generate Trigger Button */}
               <button
                 className="m3-btn m3-btn-filled"
@@ -921,9 +971,24 @@ function Generator({
                 <p style={{ margin: 0, fontSize: "0.95rem", opacity: 0.9, maxWidth: "320px", lineHeight: "1.4" }}>
                   {errorMsg}
                 </p>
-                <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.8, color: "var(--md-sys-color-on-surface-variant)" }}>
-                  Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).
-                </div>
+                {generationFailure ? (
+                  <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.9, color: "var(--md-sys-color-on-surface-variant)", maxWidth: "420px", lineHeight: "1.4", textAlign: "left" }}>
+                    <div style={{ fontWeight: 600 }}>{generationFailure.title}</div>
+                    <div>{generationFailure.action}</div>
+                    {generationFailure.showsSizeHint && (
+                      <div>Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).</div>
+                    )}
+                    <details style={{ marginTop: "6px" }}>
+                      <summary style={{ cursor: "pointer" }}>Diagnostic (sanitized)</summary>
+                      <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: "160px", overflow: "auto", fontSize: "0.75rem" }}>{generationFailure.raw}</pre>
+                      {generationFailure.rawTruncated && <div style={{ fontSize: "0.75rem" }}>The diagnostic was shortened.</div>}
+                    </details>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: "8px", fontSize: "0.85rem", opacity: 0.8, color: "var(--md-sys-color-on-surface-variant)" }}>
+                    Hint: Try lowering the resolution in the <strong>Image Constraints</strong> settings (e.g., to 512x512).
+                  </div>
+                )}
               </div>
             ) : (
               <div style={{ textAlign: "center" }}>
