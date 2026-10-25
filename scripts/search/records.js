@@ -71,6 +71,13 @@ function cvssFromNvdMetrics(metrics) {
   return null;
 }
 
+// A vendor or product name as the record gives it. Placeholders such as "n/a" mean no name, so they are dropped.
+function cleanName(value) {
+  const text = String(value || "").trim();
+  if (!text || /^(?:n\/?a|none|unknown|null|-|\*)$/i.test(text)) return null;
+  return text;
+}
+
 // CVE Services (CVE JSON 5.x) record. Accepts the record object as returned by the API.
 function parseCveRecord(json) {
   if (!json || typeof json !== "object") return null;
@@ -80,8 +87,8 @@ function parseCveRecord(json) {
   const cna = json.containers?.cna || {};
   const adps = Array.isArray(json.containers?.adp) ? json.containers.adp : [];
   const affected = (Array.isArray(cna.affected) ? cna.affected : []).map((item) => ({
-    vendor: item.vendor || null,
-    product: item.product || null,
+    vendor: cleanName(item.vendor),
+    product: cleanName(item.product),
     versions: (Array.isArray(item.versions) ? item.versions : []).map(formatVersionEntry).filter(Boolean),
   }));
   const description = (cna.descriptions || []).find((d) => /^en/i.test(d.lang || "en"))?.value || null;
@@ -123,8 +130,8 @@ function parseNvdResponse(json) {
       for (const match of node.cpeMatch || []) {
         if (!match.vulnerable) continue;
         const parts = String(match.criteria || "").split(":");
-        const vendor = parts[3] && parts[3] !== "*" ? parts[3] : null;
-        const product = parts[4] && parts[4] !== "*" ? parts[4] : null;
+        const vendor = cleanName(parts[3] && parts[3] !== "*" ? parts[3] : null);
+        const product = cleanName(parts[4] && parts[4] !== "*" ? parts[4] : null);
         if (vendor) productNames.push(vendor);
         if (product) productNames.push(product);
         const range = [];
@@ -134,7 +141,7 @@ function parseNvdResponse(json) {
         if (match.versionEndExcluding) range.push(`before ${match.versionEndExcluding}`);
         const version = parts[5] && parts[5] !== "*" ? parts[5] : null;
         if (version) range.push(version);
-        cpeRanges.push({ product: [vendor, product].filter(Boolean).join(" "), version: range.join(", ") || null });
+        cpeRanges.push({ vendor, product, version: range.join(", ") || null });
       }
     }
   }
@@ -145,7 +152,7 @@ function parseNvdResponse(json) {
     state: item.vulnStatus || null,
     title: null,
     description,
-    products: cpeRanges.length ? cpeRanges.map((range) => ({ vendor: null, product: range.product, versions: range.version ? [range.version] : [] })) : [],
+    products: cpeRanges.map((range) => ({ vendor: range.vendor, product: range.product, versions: range.version ? [range.version] : [] })),
     productNames: uniqueProducts,
     published: parseDate(item.published),
     publishedMalformed: isMalformedDate(item.published),

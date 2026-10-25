@@ -12,7 +12,7 @@ const test = require("node:test");
 
 const root = path.resolve(__dirname, "..", "..");
 const content = require(path.join(root, "scripts", "search", "content.js"));
-const { ipv6Policy, isPrivateIp, assertPublicUrl } = content;
+const { ipv6Policy, ipv6Words, isPrivateIp, isPrivateIpv4, assertPublicUrl, IPV6_ALLOCATED, IANA_IPV6_UNICAST_UPDATED } = content;
 
 const blocked = (ip) => ipv6Policy(ip).blocked;
 
@@ -36,8 +36,10 @@ test("registry: each explicit block is recorded under its own reason (100::/64 i
 
 test("registry: the documentation prefix 3fff::/20 is blocked, and the addresses just outside it are not", () => {
   for (const ip of ["3fff::1", "3fff:0::1", "3fff:0fff:ffff::1"]) assert.equal(blocked(ip), true, ip);
-  // 3fff:1000::/20 is outside the documentation prefix, so it is not blocked by it. It is an ordinary allocation.
-  assert.equal(blocked("3fff:1000::1"), false, "only the /20 is documentation");
+  // The documentation row covers 3fff:0000 to 3fff:0fff only. 3fff:1000::/20 is not listed by IANA at all, so it is
+  // reserved (see the reserved-space tests). This used to be wrongly allowed as an "ordinary allocation".
+  assert.equal(blocked("3fff:1000::1"), true, "3fff:1000::/20 is reserved, not an allocation");
+  assert.match(ipv6Policy("3fff:1000::1").reason, /reserved by IANA/);
 });
 
 test("registry: the deprecated site-local prefix fec0::/10 is blocked", () => {
@@ -136,7 +138,135 @@ test("ordinary: globally routable IPv6 destinations are allowed", () => {
 test("ordinary: the answers carry a reason, so a refused address can be explained", () => {
   assert.match(ipv6Policy("fec0::1").reason, /site-local/);
   assert.match(ipv6Policy("2001:0::1").reason, /Teredo/);
-  assert.match(ipv6Policy("2606:4700:4700::1111").reason, /globally routable/);
+  assert.match(ipv6Policy("2606:4700:4700::1111").reason, /allocated to ARIN/);
+});
+
+// --- IANA allocation: space inside 2000::/3 that is not allocated is reserved ------------------------------------
+
+test("reserved: space inside 2000::/3 that the IANA allocation table does not list is blocked (fail closed)", () => {
+  // Sources: the IANA Global Unicast Address Space registry (updated 2025-10-10). Rows marked RESERVED, and
+  // every gap between rows. The registry says all unlisted space in 2000::/3 is reserved for future allocation.
+  for (const ip of [
+    "2000::1",          // 2000::/16 is not listed
+    "2004::1",          // gap after 2003::/18
+    "2d00::1",          // 2d00::/8, RESERVED
+    "2dff:ffff::1",     // last address of 2d00::/8
+    "2e00::1",          // 2e00::/7, RESERVED
+    "3000::1",          // 3000::/5, RESERVED
+    "37ff::1",          // last part of 3000::/5
+    "3800::1",          // 3800::/6, RESERVED
+    "3f00::1",          // 3f00::/9, RESERVED
+    "3ffe::1",          // 3ffe::/16, RESERVED (former 6bone)
+    "3fff:1000::1",     // not listed: 3fff::/20 covers only 3fff:0000-3fff:0fff
+    "3fff:ffff::1",     // last part of 3fff::/16 outside the /20
+  ]) {
+    assert.equal(blocked(ip), true, `${ip} must be blocked`);
+  }
+  assert.match(ipv6Policy("2d00::1").reason, /reserved by IANA/);
+  assert.match(ipv6Policy("3f00::1").reason, /reserved by IANA/);
+});
+
+test("reserved: the documentation row is still blocked, through the special-purpose rule", () => {
+  // 3fff:0000::/20 is documentation (the RFC 9637 row). It is blocked by its own rule, not by the allocation check.
+  assert.equal(blocked("3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff"), true);
+  assert.match(ipv6Policy("3fff:0fff::1").reason, /documentation/);
+});
+
+test("allocated: valid public allocations in several RIR blocks are allowed", () => {
+  for (const ip of [
+    "2606:4700:4700::1111", // ARIN, 2600::/12
+    "2001:4860:4860::8888", // ARIN, 2001:4800::/23
+    "2400:cb00::1",         // APNIC, 2400::/12
+    "2a00:1450:4001:82a::200e", // RIPE NCC, 2a00::/12
+    "2001:200::1",          // APNIC, 2001:200::/23 (outside the 2001::/23 special block)
+    "2003::1",              // RIPE NCC, 2003::/18
+    "2800::1",              // LACNIC, 2800::/12
+    "2c00::1",              // AFRINIC, 2c00::/12
+    "2620:4f:8000::1",      // ARIN, 2620::/23
+  ]) {
+    assert.equal(blocked(ip), false, `${ip} must be allowed`);
+  }
+});
+
+test("allocated: special-purpose blocks still win inside an allocated block", () => {
+  // 2001:0db8::/32 (documentation) lies inside 2001:0c00::/23 (APNIC). The documentation block must still apply.
+  assert.equal(blocked("2001:db8::1"), true, "documentation inside an APNIC allocation");
+  assert.match(ipv6Policy("2001:db8::1").reason, /documentation/);
+  // 2001:0::/32 (Teredo) and 2001:2::/48 (benchmarking) lie inside the partly allocated 2001::/23.
+  assert.equal(blocked("2001:0::1"), true);
+  assert.equal(blocked("2001:2::1"), true);
+  // 6to4 with a private embedded address, inside the allocated 2002::/16.
+  assert.equal(blocked("2002:0a00:0001::1"), true);
+});
+
+test("allocated: the trade-off is stated, not hidden: an allocation is not an assignment", () => {
+  // An allocated block is allowed even if a given address in it is unassigned. The classifier cannot see assignments.
+  assert.equal(blocked("2400:0:0:0::1"), false);
+  assert.match(ipv6Policy("2400:0:0:0::1").reason, /allocated to APNIC/);
+});
+
+test("allocation table: every row is a valid prefix inside 2000::/3, and no two rows overlap", () => {
+  assert.match(IANA_IPV6_UNICAST_UPDATED, /^\d{4}-\d{2}-\d{2}$/, "the registry date is recorded");
+  const ranges = IPV6_ALLOCATED.map(([prefix, bits]) => {
+    const words = ipv6Words(prefix);
+    assert.ok(words, `${prefix} is a valid address`);
+    assert.ok(bits >= 1 && bits <= 128, `${prefix}/${bits} has a valid length`);
+    assert.equal((words[0] & 0xe000), 0x2000, `${prefix}/${bits} lies inside 2000::/3`);
+    return { prefix, bits, words };
+  });
+  const covers = (outer, inner) => {
+    // True when the first `outer.bits` bits of `inner.words` equal those of `outer.words`.
+    let remaining = outer.bits;
+    for (let i = 0; i < 8 && remaining > 0; i += 1) {
+      const take = Math.min(16, remaining);
+      const mask = (0xffff << (16 - take)) & 0xffff;
+      if ((inner.words[i] & mask) !== (outer.words[i] & mask)) return false;
+      remaining -= take;
+    }
+    return true;
+  };
+  for (let i = 0; i < ranges.length; i += 1) {
+    for (let j = i + 1; j < ranges.length; j += 1) {
+      const a = ranges[i];
+      const b = ranges[j];
+      const overlap = a.bits <= b.bits ? covers(a, b) : covers(b, a);
+      assert.equal(overlap, false, `${a.prefix}/${a.bits} overlaps ${b.prefix}/${b.bits}`);
+    }
+  }
+});
+
+// --- IPv4 registry review: the embedded and mapped IPv4 checks ----------------------------------------------------
+
+test("IPv4 registry: deprecated and reserved ranges are blocked (the fail-closed choice)", () => {
+  // 192.88.99.0/24: deprecated 6to4 relay anycast (RFC 7526), terminated 2015-03. Blocked.
+  for (const ip of ["192.88.99.1", "192.88.99.2"]) assert.equal(isPrivateIpv4(ip), true, ip);
+  // 192.0.0.0/24: IETF Protocol Assignments. Blocked as a whole, including 192.0.0.9 and 192.0.0.10, which the
+  // registry marks globally reachable. This is a deliberate trade-off: a fetch never needs these anycast addresses.
+  for (const ip of ["192.0.0.9", "192.0.0.10", "192.0.0.170"]) assert.equal(isPrivateIpv4(ip), true, ip);
+  // 240.0.0.0/4 (reserved) and 255.255.255.255 (limited broadcast).
+  for (const ip of ["240.0.0.1", "255.255.255.255"]) assert.equal(isPrivateIpv4(ip), true, ip);
+  // Existing protections stay in place.
+  for (const ip of ["0.0.0.0", "10.1.2.3", "127.0.0.1", "169.254.169.254", "172.16.0.1", "192.168.1.1", "100.64.0.1", "198.18.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1", "224.0.0.1"]) {
+    assert.equal(isPrivateIpv4(ip), true, ip);
+  }
+});
+
+test("IPv4 registry: globally reachable special entries outside 192.0.0.0/24 are allowed", () => {
+  // 192.31.196.0/24 (AS112-v4), 192.52.193.0/24 (AMT), 192.175.48.0/24 (direct delegation AS112): globally reachable.
+  for (const ip of ["192.31.196.1", "192.52.193.1", "192.175.48.1", "8.8.8.8", "1.1.1.1"]) {
+    assert.equal(isPrivateIpv4(ip), false, ip);
+  }
+});
+
+test("IPv4 registry: a 6to4 address that embeds a deprecated or private IPv4 address is blocked", () => {
+  assert.equal(blocked("2002:c058:6301::1"), true, "embeds 192.88.99.1, the deprecated relay range");
+  assert.equal(blocked("2002:c0a8:0101::1"), true, "embeds 192.168.1.1");
+  assert.equal(blocked("2002:c01f:c401::1"), false, "embeds 192.31.196.1, globally reachable AS112");
+});
+
+test("IPv4 registry: a mapped address that embeds a deprecated range is blocked", () => {
+  assert.equal(blocked("::ffff:192.88.99.1"), true);
+  assert.equal(blocked("::ffff:8.8.8.8"), false);
 });
 
 // --- Invalid input ---------------------------------------------------------------------------------------------------

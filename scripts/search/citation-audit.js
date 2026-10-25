@@ -10,9 +10,12 @@
 //    (for example the identifier's own record, which does not state KEV or SSVC exploitation);
 //  - a claim about an identifier's identity, product, affected versions, publication date, article date, severity
 //    or KEV listing whose citation is not among the sources that support that field;
-//  - a product named as associated with an identifier that its primary record does not name. A citation to the correct
-//    record does not make a different product correct. A product claim on an identifier with no verified product
-//    evidence is reported too;
+//  - a product named as associated with an identifier that its primary record does not name as a product. A citation
+//    to the correct record does not make a different product correct. A product claim on an identifier with no verified
+//    product evidence is reported too;
+//  - a vendor named as the vendor of an identifier that its primary record does not name as the vendor. A vendor name
+//    used as the product is a product mismatch, and a product name used as the vendor is a vendor mismatch. Vendor
+//    wording must be explicit ("vendor X", "made by X"); a name after a product cue is a product;
 //  - an EUVD identifier presented as the CVE with the same number.
 //
 // How it reads the answer:
@@ -25,8 +28,10 @@
 //  - A claim with no identifier anywhere is a generic claim and needs every finding to be confirmed.
 //
 // What it cannot establish, and reports as a limitation instead of a pass:
-//  - the meaning of product wording. Product names are compared word by word with the record's product names. Lowercase
-//    or ambiguous wording ("affects the forum software") is reported as not checked, not passed. A product named in a
+//  - the meaning of product and vendor wording. Names are compared word by word with the record's own product and
+//    vendor names, kept in separate fields. A name that is only part of a record name ("Elementor" for "News Kit Addons
+//    for Elementor") or that adds words to it is reported as not verified, not passed. Lowercase or ambiguous wording
+//    ("affects the forum software", "the vendor's software") is reported as not checked. A product or vendor named in a
 //    statement with no identifier is reported, because it cannot be attributed to a finding;
 //  - whether a sentence without an identifier is supported by its citation (it is checked for existence only);
 //  - whether a finding has source provenance at all (an older evidence shape has none);
@@ -57,6 +62,7 @@ const VERSION_WORD = /\bversions?\b|\b\d+\.\d+(?:\.\d+)*\b/i;
 const FIELD_LABELS = {
   identity: "identity",
   product: "product",
+  vendor: "vendor",
   versions: "affected-versions",
   published: "publication date",
   "article-date": "article date",
@@ -133,6 +139,9 @@ function supportFor(finding, field) {
     case "product":
       // A product is supported by the record that states it, and by read sources whose sentences link the identifier to the subject.
       return usable([finding.product?.source, finding.status === "verified" ? finding.primarySource : null, ...readSources]);
+    case "vendor":
+      // A vendor is supported by the record that states it, and by read sources whose sentences link the identifier to the subject.
+      return usable([finding.vendor?.source, finding.status === "verified" ? finding.primarySource : null, ...readSources]);
     case "versions":
       return usable([finding.affectedVersions?.source]);
     case "published":
@@ -176,37 +185,141 @@ function productItem(piece) {
   return { kind: "claim", tokens: [...new Set(tokens)] };
 }
 
-// The product claims in a clause, and the ambiguous product wording in it. A subject named in the clause is a claim too.
+// Vendor wording. A vendor is named only by explicit wording: "vendor X", "maker X", "made by X" and similar. A name
+// after a product cue is always a product, even when it is a vendor's name. So a vendor name used as the product is
+// caught as a product claim.
+// "published by" and "according to" are left out on purpose: they often name a source (CISA, NVD), not the vendor.
+const VENDOR_CUE = /\b(?:vendors?|makers?|developers?|manufacturers?)\s+(?:of\s+|is\s+|was\s+)?(?:the\s+)?|\b(?:made|developed)\s+by\s+(?:the\s+)?/gi;
+// Product wording that is really vendor wording ("products from the vendor X"). It is read by the vendor scan instead.
+const VENDOR_WORD_AHEAD = /^(?:[a-z]+\s+){0,3}?(?:vendors?|makers?|developers?|manufacturers?)\b/i;
+// Words that describe a vendor's document rather than naming the vendor ("the vendor security advisory").
+const VENDOR_GENERIC = new Set(["advisory", "advisories", "notice", "notices", "bulletin", "update", "updates", "patch",
+  "patches", "release", "releases", "statement", "security", "response", "psirt", "team", "blog", "article", "report", "fix", "fixes"]);
+
+// The name pieces after a cue: up to the end of the name, split at "and", "or" and "/".
+function namePieces(rest) {
+  const cut = rest.search(PRODUCT_PHRASE_END);
+  const phrase = (cut === -1 ? rest : rest.slice(0, cut)).trim();
+  return phrase.split(/\s+(?:and|or)\s+|\s*\/\s*/i).map((item) => item.trim()).filter(Boolean);
+}
+
+// The product and vendor claims in a clause, and the ambiguous wording in it. A subject named in the clause is a product claim.
 function productClaimsFor(clause, subject) {
   const claims = [];
   const ambiguous = [];
   if (subject) {
     const at = wordPosition(clause, subject);
-    if (at !== -1) claims.push({ text: subject, tokens: nameTokens(subject), index: at });
+    if (at !== -1) claims.push({ kind: "product", text: subject, tokens: nameTokens(subject), index: at });
   }
+  // Vendor claims first: a vendor-worded product phrase is decided by whether a vendor claim was found.
+  for (const match of clause.matchAll(VENDOR_CUE)) {
+    const start = match.index + match[0].length;
+    if (!/^[A-Z0-9]/.test(clause.charAt(start))) {
+      // Vendor wording with a name the audit cannot read as a name (lowercase) is reported, not passed. A vendor's
+      // document type ("vendor advisory") is not a name.
+      const first = namePieces(clause.slice(start))[0];
+      const words = first ? nameTokens(first) : [];
+      if (words.length && !words.every((token) => VENDOR_GENERIC.has(token))) ambiguous.push(first);
+      continue;
+    }
+    for (const piece of namePieces(clause.slice(start))) {
+      const item = productItem(piece);
+      if (item.kind === "claim" && !item.tokens.every((token) => VENDOR_GENERIC.has(token))) {
+        claims.push({ kind: "vendor", text: piece, tokens: item.tokens, index: match.index });
+      }
+    }
+  }
+  const vendorClaimFound = claims.some((claim) => claim.kind === "vendor");
   for (const match of clause.matchAll(PRODUCT_CUE)) {
     const verb = /^(?:affects?|affecting|impacts?|impacting|targets?|targeting)$/i.test(match[0].trim());
     const start = match.index + match[0].length;
     // After a preposition, only a capitalised or digit-bearing word starts a name.
     if (!verb && !/^[A-Z0-9]/.test(clause.charAt(start))) continue;
     const rest = clause.slice(start);
-    const cut = rest.search(PRODUCT_PHRASE_END);
-    const phrase = (cut === -1 ? rest : rest.slice(0, cut)).trim();
-    for (const piece of phrase.split(/\s+(?:and|or)\s+|\s*\/\s*/i).map((item) => item.trim()).filter(Boolean)) {
+    if (VENDOR_WORD_AHEAD.test(rest)) {
+      // Vendor wording that the vendor scan did not turn into a claim (for example "the vendor's software") is reported.
+      if (!vendorClaimFound) {
+        const first = namePieces(rest)[0];
+        if (first) ambiguous.push(first);
+      }
+      continue;
+    }
+    for (const piece of namePieces(rest)) {
       const item = productItem(piece);
       if (item.kind === "ambiguous") ambiguous.push(piece);
-      else if (item.kind === "claim") claims.push({ text: piece, tokens: item.tokens, index: match.index });
+      else if (item.kind === "claim") claims.push({ kind: "product", text: piece, tokens: item.tokens, index: match.index });
     }
   }
   return { claims, ambiguous };
 }
 
-// The product words a finding supports: the names in its primary record (whatever its status, because a conflicting
+// Name words for a list of names. A name with no words is dropped.
+function wordSets(names) {
+  return asArray(names).map((name) => new Set(nameTokens(name))).filter((set) => set.size > 0);
+}
+
+// The names in a finding's product or vendor field. An older shape with only a text value is read as "; "-separated names.
+function namesOf(field) {
+  if (!field) return [];
+  if (Array.isArray(field.names)) return field.names;
+  return String(field.value || "").split("; ").filter(Boolean);
+}
+
+// The product names a finding supports: the names in its primary record (whatever its status, because a conflicting
 // record still names its product), and the subject only when the record was verified against it.
-function expectedProductTokens(finding) {
-  const tokens = new Set(nameTokens(finding.product?.value));
-  if (finding.status === "verified") for (const token of nameTokens(finding.subject)) tokens.add(token);
-  return tokens;
+function productWordSets(finding) {
+  const sets = wordSets(namesOf(finding.product));
+  if (finding.status === "verified") sets.push(...wordSets([finding.subject]));
+  return sets;
+}
+
+function vendorWordSets(finding) {
+  return wordSets(namesOf(finding.vendor));
+}
+
+function sameWords(a, b) {
+  return a.size === b.size && [...a].every((word) => b.has(word));
+}
+
+function wordsWithin(a, b) {
+  return [...a].every((word) => b.has(word));
+}
+
+// How a claimed name relates to the record's names of one kind.
+//  exact: the same words as a record name.
+//  partial: only some of a record name's words (for example "Struts" for "Apache Struts").
+//  extended: a record name's words plus more (for example "PHP2Shell Lite" for "PHP2Shell").
+//  none: no relation.
+function relationOf(claimWords, sets) {
+  if (sets.some((set) => sameWords(claimWords, set))) return "exact";
+  if (sets.some((set) => wordsWithin(claimWords, set))) return "partial";
+  if (sets.some((set) => wordsWithin(set, claimWords))) return "extended";
+  return "none";
+}
+
+// The outcome of one claim against its finding's names:
+//  matched: the claim gives the record's product (or vendor) name exactly.
+//  limited: a partial or extended name. It is not verified, so it is reported as a limitation.
+//  vendor-as-product: a product claim whose words are only the record's vendor.
+//  product-as-vendor: a vendor claim whose words are only the record's product.
+//  different: a name of this kind that the record does not give.
+//  no-evidence: the record gives no name of this kind to compare with.
+function judgeClaim(claim, finding) {
+  const words = new Set(claim.tokens);
+  const products = productWordSets(finding);
+  const vendors = vendorWordSets(finding);
+  if (claim.kind === "vendor") {
+    const relation = relationOf(words, vendors);
+    if (relation === "exact") return "matched";
+    if (relation !== "none") return "limited";
+    if (products.some((set) => wordsWithin(words, set))) return "product-as-vendor";
+    return namesOf(finding.vendor).length ? "different" : "no-evidence";
+  }
+  const relation = relationOf(words, products);
+  if (relation === "exact") return "matched";
+  if (relation !== "none") return "limited";
+  if (vendors.some((set) => wordsWithin(words, set))) return "vendor-as-product";
+  return namesOf(finding.product).length ? "different" : "no-evidence";
 }
 
 // The kinds of claim a clause makes about an identifier, besides its identity and product. Negated KEV mentions make no claim.
@@ -282,49 +395,67 @@ function auditAnswer(text, evidence = {}) {
         }
       }
 
-      // 2b. Product claims. A product named as associated with an identifier must be one its own primary record names.
-      // A citation does not make a different product correct, and a product with no verified product evidence is reported.
+      // 2b. Product and vendor claims. A product named as associated with an identifier must be a product its own primary
+      // record names. A name given as the vendor must be the record's vendor. A citation does not make a different name
+      // correct, and a claim with no verified evidence is reported.
       const wording = productClaimsFor(clause, null);
       for (const piece of wording.ambiguous) {
         limit(`Product wording "${piece}" was not checked: it is not specific enough for a deterministic check.`);
       }
       if (!ids.length) {
         for (const claim of wording.claims) {
-          limit(`Product "${claim.text}" is named without an identifier, so it was not checked against any finding.`);
+          limit(`${claim.kind === "vendor" ? "Vendor" : "Product"} "${claim.text}" is named without an identifier, so it was not checked against any finding.`);
         }
       }
       for (const id of ids) {
         const finding = findingFor(id);
-        // Without provenance the product cannot be checked. That is reported under the limitations below.
+        // Without provenance the names cannot be checked. That is reported under the limitations below.
         if (!finding || !hasProvenance(finding)) continue;
-        const expected = expectedProductTokens(finding);
-        const recordNames = finding.product?.value || null;
         for (const claim of productClaimsFor(clause, finding.subject).claims) {
-          const matched = expected.size > 0 && claim.tokens.every((token) => expected.has(token));
-          let kind = null;
-          let detail = "";
-          // Inconclusive: a verified record with no structured product names cannot be compared word by word.
-          let inconclusive = false;
-          if (!matched && recordNames) {
-            kind = "product-claim-mismatch";
-            detail = `${id}: the answer associates it with "${claim.text}", but its primary record names ${recordNames}. Citing that record does not make a different product correct.`;
-          } else if (!matched) {
-            kind = "product-claim-unverified";
-            inconclusive = finding.status === "verified";
-            detail = finding.status === "verified"
-              ? `${id}: the answer associates it with "${claim.text}", but its primary record gives no product name to check against.`
-              : `${id}: the answer associates it with "${claim.text}", but no verified product evidence exists for it (status: ${finding.status}).`;
-          } else if (finding.status !== "verified") {
-            kind = "product-claim-unverified";
-            detail = `${id}: the answer associates it with "${claim.text}", but the identifier is ${finding.status}, so no product is verified for it.`;
-          }
-          if (!kind) continue;
-          // A negated claim ("does not affect X") says there is no association, so it is not a product claim.
+          // A negated claim ("does not affect X") says there is no association, so it is not checked.
           const segment = segmentBefore(clause, claim.index);
           if (NEGATION.test(segment)) continue;
-          // A hedge only applies to the words before the claim in its own segment. A hedged mismatch is a warning.
+          const isVendor = claim.kind === "vendor";
+          const label = isVendor ? "vendor" : "product";
+          const prefix = isVendor ? "vendor-claim" : "product-claim";
+          const recordedProduct = finding.product?.value || "not stated";
+          const recordedVendor = finding.vendor?.value || "not stated";
+          const verified = finding.status === "verified";
+          const outcome = judgeClaim(claim, finding);
+          if (outcome === "limited") {
+            limit(`${isVendor ? "Vendor" : "Product"} "${claim.text}" for ${id} partly matches, or adds to, the name its primary record gives (${isVendor ? recordedVendor : recordedProduct}). It is not treated as verified.`);
+            continue;
+          }
           const hedged = SCOPED_HEDGE.test(segment);
-          if (kind === "product-claim-unverified" && hedged) continue;
+          let kind = null;
+          let detail = "";
+          let inconclusive = false;
+          if (outcome === "matched") {
+            if (!verified) {
+              kind = `${prefix}-unverified`;
+              detail = `${id}: the answer associates it with "${claim.text}", but the identifier is ${finding.status}, so no ${label} is verified for it.`;
+            }
+          } else if (outcome === "vendor-as-product") {
+            kind = "product-claim-mismatch";
+            detail = `${id}: the answer names "${claim.text}" as the affected product, but its primary record gives that as the vendor. The product it names is ${recordedProduct}. Citing that record does not make a vendor name a product.`;
+          } else if (outcome === "product-as-vendor") {
+            kind = "vendor-claim-mismatch";
+            detail = `${id}: the answer names "${claim.text}" as the vendor, but its primary record gives that as the product. The vendor it names is ${recordedVendor}. Citing that record does not make a product name a vendor.`;
+          } else if (outcome === "different") {
+            kind = `${prefix}-mismatch`;
+            detail = isVendor
+              ? `${id}: the answer names "${claim.text}" as the vendor, but its primary record names ${recordedVendor}. Citing that record does not make a different vendor correct.`
+              : `${id}: the answer associates it with "${claim.text}", but its primary record names ${recordedProduct}. Citing that record does not make a different product correct.`;
+          } else if (outcome === "no-evidence") {
+            kind = `${prefix}-unverified`;
+            inconclusive = verified;
+            detail = verified
+              ? `${id}: the answer associates it with "${claim.text}", but its primary record gives no ${label} name to check against.`
+              : `${id}: the answer associates it with "${claim.text}", but no verified ${label} evidence exists for it (status: ${finding.status}).`;
+          }
+          if (!kind) continue;
+          // A hedge in the claim's own segment: an unverified claim is skipped, and a mismatch is reported as a warning.
+          if (kind.endsWith("-unverified") && hedged) continue;
           add(kind, hedged || inconclusive ? "warning" : "error", detail, `${id}|${kind}|${claim.text}`);
         }
       }
@@ -373,7 +504,9 @@ function auditAnswer(text, evidence = {}) {
           continue;
         }
         const fields = ["identity", ...fieldsIn(clause)];
-        if (productClaimsFor(clause, finding.subject).claims.length) fields.push("product");
+        const nameClaims = productClaimsFor(clause, finding.subject).claims.map((claim) => claim.kind);
+        if (nameClaims.includes("product")) fields.push("product");
+        if (nameClaims.includes("vendor")) fields.push("vendor");
         // A confirmed exploitation claim needs the source that establishes the exploitation status.
         if (positiveExploitation && isConfirmed(finding)) fields.push("exploitation");
         for (const field of fields) {

@@ -167,13 +167,24 @@ test("product 4b: with no subject, the product the record names passes", async (
   assert.deepEqual(issuesOf(right, "product-claim-mismatch"), []);
 });
 
-test("product 4c: a vendor name from the record's own metadata is accepted, as the record names it", async () => {
-  // The vendor is part of the record's product metadata ("Synthetic PHP Project PHP2Shell"). A claim that names only the
-  // vendor is consistent with the record. This is a deliberate word-level rule, and it is tested so that it stays visible.
+test("product 4c: a vendor name used as the affected product is a mismatch, even in a broad question", async () => {
+  // Earlier this passed: the vendor name was part of the product text. The record gives the vendor separately, so a
+  // vendor name in a product claim is not the affected product.
   const evidence = await broadEvidence();
   const primary = finding(evidence, "CVE-2026-109618");
   const vendor = auditAnswer(`CVE-2026-109618 affects Synthetic PHP Project [${primary.primarySource}].`, evidence);
-  assert.equal(vendor.ok, true, JSON.stringify(vendor.issues));
+  assert.equal(vendor.ok, false, JSON.stringify(vendor.issues));
+  const mismatch = issuesOf(vendor, "product-claim-mismatch");
+  assert.equal(mismatch.length, 1, JSON.stringify(vendor.issues));
+  assert.match(mismatch[0].detail, /as the vendor/);
+});
+
+test("product 4d: a vendor named with explicit vendor wording is checked against the vendor field and passes", async () => {
+  const evidence = await broadEvidence();
+  const primary = finding(evidence, "CVE-2026-109618");
+  const right = auditAnswer(`CVE-2026-109618 affects PHP2Shell from the vendor Synthetic PHP Project [${primary.primarySource}].`, evidence);
+  assert.equal(right.ok, true, JSON.stringify(right.issues));
+  assert.deepEqual(issuesOf(right, "vendor-claim-mismatch"), []);
 });
 
 // --- 5. Ambiguous product wording: reported as not checked, never silently passed ----------------------------------
@@ -272,3 +283,127 @@ test("product 9: a claim about the right product in an earlier clause does not e
   assert.equal(result.ok, false);
   assert.equal(issuesOf(result, "product-claim-mismatch").length, 1, JSON.stringify(result.issues));
 });
+
+// --- 6. Vendor and product evidence kept apart ---------------------------------------------------------------------
+
+test("evidence: the product and the vendor are kept in separate fields, with their source", async () => {
+  const f1 = await facts();
+  const primary = finding(f1.evidence, "CVE-2026-109618");
+  assert.deepEqual(primary.product.names, ["PHP2Shell"], "the product field holds the product only");
+  assert.equal(primary.product.value, "PHP2Shell");
+  assert.deepEqual(primary.vendor.names, ["Synthetic PHP Project"], "the vendor field holds the vendor only");
+  assert.equal(primary.vendor.value, "Synthetic PHP Project");
+  assert.equal(primary.vendor.source, primary.product.source, "both come from the same primary record");
+});
+
+test("6a: a correct product claim and a correct vendor claim, each checked against its own field, pass", async () => {
+  const f1 = await facts();
+  const product = auditAnswer(`CVE-2026-109618 affects PHP2Shell [${f1.primary}].`, f1.evidence);
+  assert.equal(product.ok, true, JSON.stringify(product.issues));
+  const vendor = auditAnswer(`CVE-2026-109618 was made by Synthetic PHP Project [${f1.primary}].`, f1.evidence);
+  assert.equal(vendor.ok, true, JSON.stringify(vendor.issues));
+});
+
+test("6b: a vendor name used in place of the affected product is a product mismatch, even with the right record cited", async () => {
+  const f1 = await facts();
+  const whole = auditAnswer(`CVE-2026-109618 affects Synthetic PHP Project [${f1.primary}].`, f1.evidence);
+  assert.equal(whole.ok, false);
+  assert.equal(issuesOf(whole, "product-claim-mismatch").length, 1, JSON.stringify(whole.issues));
+  // Part of the vendor's name is the same kind of error, not a partial product name.
+  const part = auditAnswer(`CVE-2026-109618 affects Synthetic [${f1.primary}].`, f1.evidence);
+  assert.equal(part.ok, false, JSON.stringify(part.issues));
+  assert.equal(issuesOf(part, "product-claim-mismatch").length, 1);
+});
+
+test("6c: a product name used as the vendor is a vendor mismatch", async () => {
+  const f1 = await facts();
+  const result = auditAnswer(`CVE-2026-109618 was made by PHP2Shell [${f1.primary}].`, f1.evidence);
+  assert.equal(result.ok, false, JSON.stringify(result.issues));
+  assert.equal(issuesOf(result, "vendor-claim-mismatch").length, 1, JSON.stringify(result.issues));
+});
+
+test("6d: a product sharing words with the real product is a mismatch, and a partial name is a limitation", async () => {
+  const result = await research("News Kit Addons for Elementor CVE-2026-97353 status?");
+  const evidence = { sources: result.sources, findings: result.findings };
+  const news = finding(evidence, "CVE-2026-97353");
+  assert.equal(news.status, "verified", "fixture precondition");
+  assert.equal(news.product.value, "News Kit Addons for Elementor", "fixture precondition");
+  // Elementor Pro Widget Pack is CVE-2026-97354's product. It shares "Elementor" with the real product.
+  const wrong = auditAnswer(`CVE-2026-97353 affects Elementor Pro Widget Pack [${news.primarySource}].`, evidence);
+  assert.equal(wrong.ok, false, JSON.stringify(wrong.issues));
+  assert.equal(issuesOf(wrong, "product-claim-mismatch").length, 1);
+  // "Elementor" alone is only part of the real product's name: it is not verified, and it is reported.
+  const partial = auditAnswer(`CVE-2026-97353 affects Elementor [${news.primarySource}].`, evidence);
+  assert.equal(issuesOf(partial, "product-claim-mismatch").length, 0, JSON.stringify(partial.issues));
+  assert.ok(partial.limitations.some((line) => /"Elementor" for CVE-2026-97353 partly matches/.test(line)), JSON.stringify(partial.limitations));
+});
+
+test("6e: the vendor of a second product is not the vendor of the first (vendor claims are checked per finding)", async () => {
+  const result = await research("News Kit Addons for Elementor CVE-2026-97353 status?");
+  const evidence = { sources: result.sources, findings: result.findings };
+  const news = finding(evidence, "CVE-2026-97353");
+  const right = auditAnswer(`CVE-2026-97353 was made by Synthetic Vendor [${news.primarySource}].`, evidence);
+  assert.equal(right.ok, true, JSON.stringify(right.issues));
+  const wrong = auditAnswer(`CVE-2026-97353 was made by Synthetic PHP Project [${news.primarySource}].`, evidence);
+  assert.equal(wrong.ok, false, JSON.stringify(wrong.issues));
+  assert.equal(issuesOf(wrong, "vendor-claim-mismatch").length, 1);
+});
+
+test("6f: a broad question with no subject still checks vendor and product claims", async () => {
+  const evidence = await broadEvidence();
+  const primary = finding(evidence, "CVE-2026-109618");
+  assert.equal(primary.subject, null, "fixture precondition");
+  const vendorRight = auditAnswer(`CVE-2026-109618 was made by Synthetic PHP Project [${primary.primarySource}].`, evidence);
+  assert.equal(vendorRight.ok, true, JSON.stringify(vendorRight.issues));
+  const vendorWrong = auditAnswer(`CVE-2026-109618 was made by PHP2Shell [${primary.primarySource}].`, evidence);
+  assert.equal(vendorWrong.ok, false);
+  assert.equal(issuesOf(vendorWrong, "vendor-claim-mismatch").length, 1);
+});
+
+test("6g: vendor wording the audit cannot read is reported as not checked, not passed", async () => {
+  const f1 = await facts();
+  const possessive = auditAnswer(`CVE-2026-109618 affects the vendor's software [${f1.primary}].`, f1.evidence);
+  assert.equal(possessive.ok, true);
+  assert.ok(possessive.limitations.some((line) => /"the vendor's software" was not checked/.test(line)), JSON.stringify(possessive.limitations));
+  const lower = auditAnswer(`CVE-2026-109618 was made by synthetic php project [${f1.primary}].`, f1.evidence);
+  assert.ok(lower.limitations.some((line) => /"synthetic php project" was not checked/.test(line)), JSON.stringify(lower.limitations));
+});
+
+test("6h: a negated vendor association is not a claim", async () => {
+  const f1 = await facts();
+  const result = auditAnswer(`CVE-2026-109618 is not made by Synthetic PHP Project [${f1.primary}].`, f1.evidence);
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.deepEqual(issuesOf(result, "vendor-claim-mismatch"), []);
+});
+
+test("6j: a source named by 'published by' is not read as the vendor", async () => {
+  const f1 = await facts();
+  // The named body is the source of the statement, not the vendor. Reading it as a vendor would be a false mismatch.
+  // (CISA is not used here: its name is a neutral word, so it is never read as a name at all.)
+  const result = auditAnswer(`CVE-2026-109618 affects PHP2Shell, and the advisory was published by Tenable Research [${f1.primary}].`, f1.evidence);
+  assert.deepEqual(issuesOf(result, "vendor-claim-mismatch"), [], JSON.stringify(result.issues));
+  assert.deepEqual(issuesOf(result, "product-claim-mismatch"), [], JSON.stringify(result.issues));
+});
+
+test("6i: a vendor document type such as 'vendor advisory' is not read as a vendor name", async () => {
+  const f1 = await facts();
+  const result = auditAnswer(`CVE-2026-109618 is covered in the vendor advisory [${f1.primary}].`, f1.evidence);
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.deepEqual(result.limitations.filter((line) => /Vendor/.test(line)), []);
+});
+
+test("records: an NVD CPE gives the vendor and the product as separate names", () => {
+  const { parseNvdResponse } = require(path.join(root, "scripts", "search", "records.js"));
+  const record = parseNvdResponse({
+    vulnerabilities: [{ cve: {
+      id: "CVE-2026-1234567",
+      vulnStatus: "Analyzed",
+      published: "2026-01-01T00:00:00.000",
+      descriptions: [{ lang: "en", value: "Synthetic NVD record." }],
+      configurations: [{ nodes: [{ cpeMatch: [{ vulnerable: true, criteria: "cpe:2.3:a:apache:struts:*:*:*:*:*:*:*:*", versionEndExcluding: "2.5.33" }] }] }],
+    } }],
+  });
+  assert.deepEqual(record.products.map((item) => [item.vendor, item.product]), [["apache", "struts"]]);
+  assert.deepEqual(record.productNames.sort(), ["apache", "struts"]);
+});
+

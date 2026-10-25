@@ -46,7 +46,11 @@ function findingLines(finding) {
   if (finding.subject) lines.push(`  subject of the question: ${finding.subject}`);
   if (finding.product) {
     lines.push(`  product${finding.product.mismatch ? " (does NOT match the subject)" : ""}: ${finding.product.value || "not stated in structured fields"} ${refs([finding.product.source])}`);
-  } else if (finding.productCheck === "matched") {
+  }
+  if (finding.vendor) {
+    lines.push(`  vendor: ${finding.vendor.value || "not stated in structured fields"} ${refs([finding.vendor.source])}`);
+  }
+  if (!finding.product && finding.productCheck === "matched") {
     lines.push("  product: the record text names the subject (no structured product field)");
   }
   if (finding.affectedVersions) lines.push(`  affected versions: ${finding.affectedVersions.value} ${refs([finding.affectedVersions.source])}`);

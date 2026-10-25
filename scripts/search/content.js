@@ -35,6 +35,7 @@ function isPrivateIpv4(ip) {
     (a === 192 && b === 168) ||
     (a === 192 && b === 0 && (c === 0 || c === 2)) ||     // 192.0.0.0/24 and TEST-NET-1 192.0.2.0/24
     (a === 198 && (b === 18 || b === 19)) ||
+    (a === 192 && b === 88 && c === 99) ||                // deprecated 6to4 relay anycast (RFC 7526), no longer usable
     (a === 198 && b === 51 && c === 100) ||               // TEST-NET-2
     (a === 203 && b === 0 && c === 113) ||                // TEST-NET-3
     a >= 224;
@@ -66,13 +67,18 @@ function isPrivateIpv4(ip) {
 //     2001:1::1/128, 2001:1::2/128 and 2001:1::3/128, AMT (2001:3::/32), AS112-v6 (2001:4:112::/48),
 //     ORCHIDv2 (2001:20::/28) and Drone Remote ID (2001:30::/28).
 //  7. Anything outside 2000::/3. Blocked. IANA allocates global unicast addresses only inside 2000::/3.
-//  8. Anything else inside 2000::/3 is allowed. This includes ordinary allocations such as 2606:4700::/32 and
-//     2001:4860::/32.
+//  8. Inside 2000::/3 but outside every IANA allocation (IPV6_ALLOCATED, from the Global Unicast Address Space
+//     registry). Blocked: IANA reserves everything it has not listed for future allocation. Examples: 2000::/16,
+//     2d00::/8, 3000::/5, 3f00::/9 and 3fff:1000::/20. 3fff::/20 is documentation (rule 3); only its first 4 KiB is listed.
+//  9. Inside an allocated block, and not matched by any rule above. Allowed. Examples: 2606:4700::/32 (ARIN),
+//     2001:4860::/32 (ARIN), 2400:cb00::/32 (APNIC).
 //
-// Trade-off: rule 8 allows an address inside 2000::/3 that a later registry change marks as special-purpose,
-// until this list is updated. Rule 7 is a default-deny for everything else. This classifier never fetches anything; it
-// only decides whether an address may be connected to. The registry is copied by hand, so the list must be re-checked
-// when the registry changes. Tests: scripts/tests/web-research-ipv6.test.cjs.
+// Trade-offs. (a) An allocation to an RIR is not an assignment: an address in an allocated block can still be unassigned,
+// and the fetcher allows it. (b) The lists are copied by hand: IPV6_ALLOCATED from the Global Unicast registry, updated
+// 2025-10-10, and the explicit blocks from the Special-Purpose registry, updated 2025-10-09. Both were read 2026-10-24.
+// A registry change that adds a block inside an allocated range stays allowed until these lists are updated. Re-check
+// both lists when either registry's "Last Updated" date changes (see docs/web-research.md). This classifier never
+// fetches anything. It only decides whether an address may be connected to. Tests: scripts/tests/web-research-ipv6.test.cjs.
 
 // Expands an IPv6 address to eight 16-bit numbers, or returns null when it is not a valid address. A zone identifier
 // (fe80::1%eth0) is removed first, so the zone cannot change the classification. An embedded IPv4 suffix is converted.
@@ -133,6 +139,32 @@ const IPV6_GLOBAL_EXCEPTIONS = [
   ["2001:3::", 32], ["2001:4:112::", 48], ["2001:20::", 28], ["2001:30::", 28],
 ];
 
+// The IANA IPv6 Global Unicast Address Space registry: the ALLOCATED rows inside 2000::/3. Last updated 2025-10-10 in
+// the registry. Source: https://www.iana.org/assignments/ipv6-unicast-address-assignments
+// The registry states that all address space inside 2000::/3 that is not listed is RESERVED by IANA for future
+// allocation. So an address that matches no row here is reserved, and it is blocked. Each row is an allocation to an
+// RIR or IANA. Being allocated to an RIR does not mean the block is assigned to a network, so an address in an allocated
+// block can still be unassigned. That trade-off is documented in docs/web-research.md.
+const IANA_IPV6_UNICAST_UPDATED = "2025-10-10";
+const IPV6_ALLOCATED = [
+  ["2001::", 23, "IANA, partly allocated (its special-purpose entries are handled before this list)"],
+  ["2001:200::", 23, "APNIC"], ["2001:400::", 23, "ARIN"], ["2001:600::", 23, "RIPE NCC"],
+  ["2001:800::", 22, "RIPE NCC"], ["2001:c00::", 23, "APNIC"], ["2001:e00::", 23, "APNIC"],
+  ["2001:1200::", 23, "LACNIC"], ["2001:1400::", 22, "RIPE NCC"], ["2001:1800::", 23, "ARIN"],
+  ["2001:1a00::", 23, "RIPE NCC"], ["2001:1c00::", 22, "RIPE NCC"], ["2001:2000::", 19, "RIPE NCC"],
+  ["2001:4000::", 23, "RIPE NCC"], ["2001:4200::", 23, "AFRINIC"], ["2001:4400::", 23, "APNIC"],
+  ["2001:4600::", 23, "RIPE NCC"], ["2001:4800::", 23, "ARIN"], ["2001:4a00::", 23, "RIPE NCC"],
+  ["2001:4c00::", 23, "RIPE NCC"], ["2001:5000::", 20, "RIPE NCC"], ["2001:8000::", 19, "APNIC"],
+  ["2001:a000::", 20, "APNIC"], ["2001:b000::", 20, "APNIC"],
+  ["2002::", 16, "6to4 (its embedded IPv4 address is checked before this list)"],
+  ["2003::", 18, "RIPE NCC"],
+  ["2400::", 12, "APNIC"], ["2410::", 12, "APNIC"],
+  ["2600::", 12, "ARIN"], ["2610::", 23, "ARIN"], ["2620::", 23, "ARIN"], ["2630::", 12, "ARIN"],
+  ["2800::", 12, "LACNIC"],
+  ["2a00::", 12, "RIPE NCC"], ["2a10::", 12, "RIPE NCC"],
+  ["2c00::", 12, "AFRINIC"],
+];
+
 // The classification of one IPv6 address: { blocked, reason }. Reasons are for tests and documentation.
 function ipv6Policy(ip) {
   const words = ipv6Words(ip);
@@ -170,8 +202,13 @@ function ipv6Policy(ip) {
   if ((words[0] & 0xe000) !== 0x2000) {
     return { blocked: true, reason: "outside 2000::/3, the global unicast space" };
   }
-  // 8. Everything else inside 2000::/3 is an ordinary allocation.
-  return { blocked: false, reason: "globally routable unicast" };
+  // 8. Inside 2000::/3 but not in an IANA allocation: reserved for future allocation, so blocked (fail closed).
+  const allocation = IPV6_ALLOCATED.find(([prefix, bits]) => matchesPrefix(words, prefix, bits));
+  if (!allocation) {
+    return { blocked: true, reason: "reserved by IANA: not in the global unicast allocation table" };
+  }
+  // 9. An allocated block, and no special-purpose entry above applies.
+  return { blocked: false, reason: `allocated to ${allocation[2]}` };
 }
 
 function isPrivateIpv6(ip) {
@@ -373,6 +410,8 @@ module.exports = {
   isPrivateIpv6,
   ipv6Policy,
   ipv6Words,
+  IPV6_ALLOCATED,
+  IANA_IPV6_UNICAST_UPDATED,
   stripHtml,
   MAX_REDIRECTS,
 };

@@ -137,10 +137,14 @@ function versionsText(products) {
   return parts.length ? parts.join(" | ") : null;
 }
 
-function productText(primary) {
-  const names = primary.products.map((item) => [item.vendor, item.product].filter(Boolean).join(" ")).filter(Boolean);
-  if (names.length) return [...new Set(names)].join("; ");
-  return primary.productNames.length ? [...new Set(primary.productNames)].join("; ") : null;
+// The product or vendor names a primary record gives, kept apart. A vendor name is never taken as a product name, and a
+// product name is never taken as a vendor name. A record that gives no name of the kind gives an empty list.
+function namesFrom(primary, key) {
+  return [...new Set(primary.products.map((item) => item[key]).filter(Boolean))];
+}
+
+function joinedOrNull(names) {
+  return names.length ? names.join("; ") : null;
 }
 
 function cvssText(cvss) {
@@ -426,9 +430,15 @@ function buildFindings({ subject = null, sources = [], lookups = new Map(), kev 
       statusLabel: STATUS_LABELS[status],
       productCheck,
       product: primary && (verified || productCheck === "mismatch") ? {
-        value: productText(primary),
+        value: joinedOrNull(namesFrom(primary, "product")),
+        names: namesFrom(primary, "product"),
         source: primary.sourceIndex,
         mismatch: productCheck === "mismatch",
+      } : null,
+      vendor: primary && (verified || productCheck === "mismatch") ? {
+        value: joinedOrNull(namesFrom(primary, "vendor")),
+        names: namesFrom(primary, "vendor"),
+        source: primary.sourceIndex,
       } : null,
       affectedVersions: verified ? (() => {
         const value = versionsText(primary.products);
