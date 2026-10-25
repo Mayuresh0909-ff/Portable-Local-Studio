@@ -167,6 +167,7 @@ It works per sentence and per clause:
 - A hedge in one clause does not neutralise a positive claim in another clause of the same sentence.
 - A generic claim with no identifiers ("the vulnerabilities are actively exploited") is supported only when **every** finding is confirmed. One KEV-listed finding is not enough.
 - A public proof-of-concept is not confirmed exploitation.
+- A confirmed exploitation claim needs a valid source index for its exploitation status: a whole number of 1 or more that is one of the sources in the evidence. A missing (`null`, `undefined`, empty) or invalid index is reported as `exploitation-source-unavailable`. No citation is accepted in its place, so `[0]` never supports the claim.
 - Citation numbers must match a listed source. An identifier with an EUVD number presented as a CVE number is flagged.
 
 It flags: an unverified identifier stated as fact, a product association that the identifier's record does not support, an unconfirmed exploitation claim, a generic exploitation claim that is not supported, an invalid citation, a citation that does not support its claim, and possible EUVD-as-CVE confusion. It does not judge whether a sentence is true, whether a source is right, or whether the answer covers the question.
@@ -230,7 +231,7 @@ What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `
 | --- | --- | --- |
 | `scripts/tests/web-research.test.cjs` | Planner, evidence rules, context, the citation check (earlier cases). | Fixtures and fakes |
 | `scripts/tests/web-research-correction.test.cjs` | Broad and named subjects, date ordering and labels, the advisory allowlist, citation check cases. | Fixtures and fakes |
-| `scripts/tests/web-research-provenance.test.cjs` | Citation provenance: a relevant citation, an unrelated one, a wrong product, an exploitation claim cited to the identifier record, and a statement the check cannot check. | Fixtures and fakes |
+| `scripts/tests/web-research-provenance.test.cjs` | Citation provenance: a relevant citation, an unrelated one, a wrong product, an exploitation claim cited to the identifier record, a missing or invalid exploitation source index, and a statement the check cannot check. | Fixtures and fakes |
 | `scripts/tests/web-research-dates.test.cjs` | Both ends of the range, future and malformed dates, unknown dates, explicit "Any time". | Fixtures and fakes |
 | `scripts/tests/web-research-product.test.cjs` | Product and vendor claims in the answer, kept apart: the correct product and vendor, a vendor name used as the product, a product name used as the vendor, a wrong product sharing words with the real one, a partial name (not verified), a wrong product cited to the correct record, broad questions with no subject, ambiguous and lowercase wording, negation, hedging, and the NVD vendor/product split. | Fixtures (no network) |
 | `scripts/tests/web-research-fetch.test.cjs` | The connect-time check, DNS rebinding, redirects, and address classes. DNS is replaced. Redirect and size tests use a mocked request function. One rebinding test uses Node's own request code, with a loopback listener that the test owns. | Fakes, plus a test-owned loopback listener (no external network) |
@@ -238,11 +239,19 @@ What the tests show. `scripts/tests/web-research-fetch.test.cjs` runs the real `
 | `scripts/tests/web-research-content.test.cjs` | Address checks, redirects, DuckDuckGo parsing, source tiers. | Fixtures and fakes |
 | `scripts/tests/web-research-route.test.cjs` | The HTTP routes, with the server started on a test port. | Local server |
 
-Run them with:
+Run the targeted Web Research tests (nine files, no network) with:
 
 ```
-node --test scripts/tests/web-research.test.cjs scripts/tests/web-research-content.test.cjs scripts/tests/web-research-route.test.cjs scripts/tests/web-research-correction.test.cjs scripts/tests/web-research-provenance.test.cjs scripts/tests/web-research-dates.test.cjs scripts/tests/web-research-fetch.test.cjs
+node --test scripts/tests/web-research.test.cjs scripts/tests/web-research-correction.test.cjs scripts/tests/web-research-content.test.cjs scripts/tests/web-research-route.test.cjs scripts/tests/web-research-provenance.test.cjs scripts/tests/web-research-dates.test.cjs scripts/tests/web-research-fetch.test.cjs scripts/tests/web-research-product.test.cjs scripts/tests/web-research-ipv6.test.cjs
 ```
+
+Run the complete project suite, which includes these files and the other project tests, with:
+
+```
+node --test scripts/tests/*.test.cjs
+```
+
+The two commands are separate: report the targeted result and the full-suite result as two results. Some full-suite tests import the frontend's `@tauri-apps/api` package. Install the frontend dependencies first (`cd app/frontend && npm ci`), or those tests fail with `Cannot find package '@tauri-apps/api'`.
 
 None of these tests calls DuckDuckGo, NVD, CVE Services or CISA. A passing run shows that the rules work on the fixtures. It does not show that the live pipeline works today.
 

@@ -192,3 +192,70 @@ test("provenance: a search result that was never read is not evidence for a prod
   assert.match(productIssue.detail, new RegExp(`cited to \\[9\\].*support it are \\[${f1.primary}\\]`));
   assert.doesNotMatch(productIssue.detail, /support it are [^.]*\[9\]/);
 });
+
+// --- Exploitation sources: a missing or invalid source index is never a valid citation --------------------------------
+// The KEV-backed finding is CVE-2026-109618. Each test replaces only its exploitation source value, and says so.
+
+function withExploitationSource(evidence, source) {
+  return {
+    ...evidence,
+    findings: evidence.findings.map((item) => (item.identifier === "CVE-2026-109618"
+      ? { ...item, exploitation: { ...item.exploitation, source } }
+      : item)),
+  };
+}
+
+for (const [label, source] of [["null", null], ["undefined", undefined], ["an empty string", ""], ["a whitespace string", "  "]]) {
+  test(`exploitation source: ${label} is not an index, so an exploitation claim is not checked against a source [0]`, async () => {
+    const f1 = await facts();
+    const evidence = withExploitationSource(f1.evidence, source); // replaces only the source value
+    // Citing [0] must not pass: Number(null) is 0, so a naive check would have accepted it.
+    for (const cite of [f1.kev, 0]) {
+      const result = auditAnswer(`CVE-2026-109618 is actively exploited [${cite}].`, evidence);
+      assert.equal(result.ok, false, `cite [${cite}] with source ${label}: ${JSON.stringify(result.issues)}`);
+      const issue = result.issues.find((item) => item.type === "exploitation-source-unavailable");
+      assert.ok(issue, JSON.stringify(result.issues));
+      assert.match(issue.detail, /has no source index/);
+      assert.doesNotMatch(issue.detail, /\[0\]/, "the detail does not present [0] as a source");
+    }
+  });
+}
+
+for (const [label, source] of [["zero", 0], ["a negative number", -1], ["a fractional number", 1.5], ["a non-numeric string", "kev"], ["a boolean", true]]) {
+  test(`exploitation source: ${label} is not a valid source index`, async () => {
+    const f1 = await facts();
+    const evidence = withExploitationSource(f1.evidence, source);
+    const result = auditAnswer(`CVE-2026-109618 is actively exploited [${f1.kev}].`, evidence);
+    assert.equal(result.ok, false, JSON.stringify(result.issues));
+    assert.ok(types(result).includes("exploitation-source-unavailable"), JSON.stringify(result.issues));
+  });
+}
+
+test("exploitation source: an index that is not in the evidence is invalid, even when it is cited", async () => {
+  const f1 = await facts();
+  const unknown = Math.max(...f1.evidence.sources.map((source) => source.index)) + 50;
+  const evidence = withExploitationSource(f1.evidence, unknown); // the source list has no such index
+  const result = auditAnswer(`CVE-2026-109618 is actively exploited [${unknown}].`, evidence);
+  assert.equal(result.ok, false, JSON.stringify(result.issues));
+  const issue = result.issues.find((item) => item.type === "exploitation-source-unavailable");
+  assert.ok(issue, JSON.stringify(result.issues));
+  assert.match(issue.detail, new RegExp(`\\[${unknown}\\], which is not one of the sources`));
+});
+
+test("exploitation source: the KEV field is not supported by a missing source either", async () => {
+  const f1 = await facts();
+  const evidence = withExploitationSource(f1.evidence, null);
+  const result = auditAnswer(`CVE-2026-109618 is in the CISA KEV catalogue [${f1.kev}].`, evidence);
+  assert.equal(result.ok, false, JSON.stringify(result.issues));
+  assert.ok(types(result).includes("citation-not-supporting-claim"), JSON.stringify(result.issues));
+});
+
+test("exploitation source: a valid source index still supports the claim (legitimate references are preserved)", async () => {
+  const f1 = await facts();
+  const result = auditAnswer(`CVE-2026-109618 is actively exploited [${f1.kev}].`, f1.evidence);
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.deepEqual(result.issues, []);
+  // The same valid index also supports the KEV listing, as before.
+  const kev = auditAnswer(`CVE-2026-109618 is in the CISA KEV catalogue [${f1.kev}].`, f1.evidence);
+  assert.equal(kev.ok, true, JSON.stringify(kev.issues));
+});

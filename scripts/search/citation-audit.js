@@ -129,8 +129,22 @@ function hasProvenance(finding) {
 // The source numbers that support one kind of claim about a finding. Only a source that actually provides the field
 // counts. A primary record supports the identifier and, when verified, its product and versions. It does not
 // support an exploitation claim, which needs the source that establishes the exploitation status.
-function supportFor(finding, field) {
-  const usable = (values) => [...new Set(values.filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value))).map(Number))];
+// A source index as the research run numbers sources: a positive whole number, counting from 1. Missing, empty, boolean,
+// fractional, zero and negative values are not indexes. Number(null) and Number("") are both 0, so they are rejected
+// before any conversion. The result is null when the value is not an index.
+function sourceIndexOf(value) {
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    const number = Number(value.trim());
+    return number > 0 ? number : null;
+  }
+  return null;
+}
+
+// The source indexes a finding supports a field with. An index counts only if it is one of the sources the audit was
+// given (known), so a stale or invented index cannot support a claim. The known set is required.
+function supportFor(finding, field, known) {
+  const usable = (values) => [...new Set(values.map(sourceIndexOf).filter((index) => index !== null && known.has(index)))];
   const exploitation = finding.exploitation || {};
   const readSources = asArray(finding.readSources);
   switch (field) {
@@ -514,7 +528,18 @@ function auditAnswer(text, evidence = {}) {
           if (field === "identity" && finding.status !== "verified") continue;
           if (field === "exploitation") {
             // Exploitation is supported only by the source that states it, which is not the identifier record.
-            const exploitationSource = Number.isFinite(Number(finding.exploitation?.source)) ? [Number(finding.exploitation.source)] : [];
+            const exploitationIndex = sourceIndexOf(finding.exploitation?.source);
+            if (exploitationIndex === null || !indexes.has(exploitationIndex)) {
+              // The claim cannot be checked against a source. This is reported, and no citation is accepted in its place.
+              const reason = exploitationIndex === null
+                ? "the exploitation status has no source index"
+                : `the exploitation status names source [${exploitationIndex}], which is not one of the sources in the evidence`;
+              add("exploitation-source-unavailable", "error",
+                `${id} is described as actively exploited, but ${reason}. The claim cannot be checked against a source.`,
+                `${id}|exploitation-source`);
+              continue;
+            }
+            const exploitationSource = [exploitationIndex];
             claimChecks += 1;
             const good = cites.filter((n) => exploitationSource.includes(n));
             const bad = cites.filter((n) => !exploitationSource.includes(n));
@@ -529,7 +554,7 @@ function auditAnswer(text, evidence = {}) {
             }
             continue;
           }
-          const supported = supportFor(finding, field);
+          const supported = supportFor(finding, field, indexes);
           claimChecks += 1;
           const label = FIELD_LABELS[field] || field;
           const good = cites.filter((n) => supported.includes(n));
